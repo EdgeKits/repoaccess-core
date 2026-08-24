@@ -1,0 +1,3 @@
+# Normalize line endings to LF for all text files (cross-platform consistency).
+# Prevents the CRLF churn Git warns about on Windows checkouts.
+* text=auto eol=lf

@@ -1,0 +1,129 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ *
+ * This is the COMMITTED `.example` TEMPLATE. Copy it to `wrangler.jsonc` and fill in your KV namespace
+ * ids and custom domain (`cp wrangler.jsonc.example wrangler.jsonc`, or let the setup wizard
+ * write it). The real `wrangler.jsonc` is gitignored, so a `git pull` update never overwrites your ids or
+ * domain. `wrangler deploy`/`dev`/`types` read the real file.
+ *
+ * RepoAccess core worker bindings.
+ * Secrets (GITHUB_TOKEN, *_WEBHOOK_SECRET, EVENT_WEBHOOK_*) are NOT declared here - they live in
+ * .dev.vars (sandbox) / .dev.vars.production (live) and are set in the deployed worker via
+ * `npx wrangler secret put --env production`.
+ * CONFIG-AS-CODE: non-secret config (githubOrg, productTeamMap, branding, eventWebhook)
+ * is NO LONGER a `vars` block here - it lives in the typed `src/config/repoaccess.config.ts` and is selected
+ * per-environment by which entry `main` loads (sandbox → src/index.ts, production →
+ * src/index.production.ts).
+ * NOTE: the `/wh/:adapter/:secret_path` segment is unenforced obscurity for HMAC
+ * adapters (the worker never validates it - HMAC is the gate), so *_WEBHOOK_PATH is deliberately
+ * NOT a required secret. Path-as-validated-secret is an api_callback concern (no signature there).
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "repoaccess-core",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-13",
+  "assets": {
+    "binding": "ASSETS",
+    "directory": "./public",
+  },
+  "observability": {
+    "enabled": true,
+  },
+  "upload_source_maps": true,
+
+  // One static Workflow class; grant/revoke are run params. The class MUST be
+  // exported from `main` or `wrangler dev`/`deploy` fail to resolve the binding.
+  // Workflow `name` is account-global, so two workers on one Cloudflare account that share a name do
+  // NOT get two Workflows: the single Workflow is reassigned to whichever deployed last and the other
+  // worker's binding breaks. These names therefore carry a product prefix (per-env: `oss-access-workflow`
+  // here, `oss-access-workflow-production` below) so this install never collides with another worker of
+  // yours on the same account. Binding + class_name unchanged - only the account-global name is prefixed.
+  "workflows": [
+    {
+      "name": "oss-access-workflow",
+      "binding": "ACCESS_WORKFLOW",
+      "class_name": "AccessWorkflow",
+    },
+  ],
+
+  // Pending claims (TTL 30d), team slug→id cache, grant correlation records.
+  // `id` is a placeholder - a deployer provisions their own KV namespace (default title
+  // "repoaccess-core-ENTITLEMENTS") and pastes its id here; the setup guide covers it. Create it with
+  // `npx wrangler kv namespace create repoaccess-core-ENTITLEMENTS` or the dashboard. Pass the full
+  // prefixed title, not a bare `ENTITLEMENTS`: wrangler titles the namespace exactly what you type,
+  // titles are account-wide, and several workers on one account would collide on the bare name.
+  "kv_namespaces": [
+    {
+      "binding": "ENTITLEMENTS",
+      "id": "PLACEHOLDER_SANDBOX_ENTITLEMENTS_REPLACE_ME",
+    },
+  ],
+
+  // Claim single-flight guard. A DO per claim ({adapter}:{transaction_id}) serializes
+  // POST processing so concurrent submits can't over-grant. Class MUST be exported from `main`.
+  "durable_objects": {
+    "bindings": [{ "name": "CLAIM_GUARD", "class_name": "ClaimGuard" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ClaimGuard"] }],
+
+  // Required secrets - Cloudflare validates these are set before a deploy succeeds, and
+  // `npx wrangler types` types ONLY these names (defining `secrets` stops .dev.vars name-inference).
+  // Values live in
+  // .dev.vars / .dev.vars.production and are set via `npx wrangler secret put` - never declared here.
+  // NOTE: the OPTIONAL EVENT_WEBHOOK_SECRET is deliberately not listed (outbound delivery is opt-in
+  // via `eventWebhook.url` in src/config/repoaccess.config.ts, not an env var) - so it is no longer
+  // name-inferred either; see events.ts.
+  "secrets": {
+    "required": ["GITHUB_TOKEN", "STRIPE_WEBHOOK_SECRET"],
+  },
+
+  // Non-secret config is NOT here - it lives in src/config/repoaccess.config.ts (config-as-code).
+  // The default/sandbox `main` (src/index.ts) binds the `sandbox` profile.
+
+  // Live environment. Wrangler environments do NOT inherit top-level bindings, so each binding is
+  // restated here. Deploy with `npx wrangler deploy --env production`; set secrets with
+  // `npx wrangler secret put --env production`.
+  "env": {
+    "production": {
+      // Per-env `main`: the production entry binds the `production` config profile. `main`
+      // is an inheritable key, overridable per-environment (Wrangler config reference).
+      "main": "src/index.production.ts",
+      // Production custom domain (uncomment + set your domain; it MUST be a zone in THIS Cloudflare account,
+      // or wrangler cannot provision the DNS record + certificate on deploy):
+      // "routes": [
+      //   { "pattern": "repoaccess.example.dev", "custom_domain": true }
+      // ]
+      // oss-prefixed + per-env (the name is account-global).
+      "workflows": [
+        {
+          "name": "oss-access-workflow-production",
+          "binding": "ACCESS_WORKFLOW",
+          "class_name": "AccessWorkflow",
+        },
+      ],
+      "kv_namespaces": [
+        {
+          "binding": "ENTITLEMENTS",
+          // Replace this with your production ENTITLEMENTS namespace id (default title
+          // "repoaccess-core-production-ENTITLEMENTS").
+          "id": "PLACEHOLDER_PRODUCTION_ENTITLEMENTS_REPLACE_ME",
+        },
+      ],
+      "durable_objects": {
+        "bindings": [{ "name": "CLAIM_GUARD", "class_name": "ClaimGuard" }],
+      },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ClaimGuard"] }],
+      // `secrets` is non-inheritable - restated for the production env (same set as top-level).
+      "secrets": {
+        "required": ["GITHUB_TOKEN", "STRIPE_WEBHOOK_SECRET"],
+      },
+      // Non-secret config lives in src/config/repoaccess.config.ts (`production` profile) -
+      // selected by this env's `main` override above. No `vars` block.
+      "observability": {
+        "enabled": true,
+      },
+    },
+  },
+}

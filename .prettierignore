@@ -1,0 +1,8 @@
+# Generated / vendored - not ours to format
+node_modules
+dist
+.wrangler
+worker-configuration.d.ts
+package-lock.json
+public
+audit

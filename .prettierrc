@@ -1,0 +1,11 @@
+{
+  "singleQuote": true,
+  "semi": false,
+  "endOfLine": "lf",
+  "overrides": [
+    {
+      "files": ["*.jsonc", "wrangler.jsonc.example"],
+      "options": { "parser": "jsonc" }
+    }
+  ]
+}

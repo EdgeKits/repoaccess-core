@@ -1,0 +1,85 @@
+{
+  "name": "repoaccess-core",
+  "version": "3.1.0",
+  "description": "Sell access to a private GitHub repo on your own infrastructure, with the payment provider you already use.",
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EdgeKits/repoaccess-core.git"
+  },
+  "homepage": "https://edgekits.dev/en/tools/repoaccess/",
+  "bugs": {
+    "url": "https://github.com/EdgeKits/repoaccess-core/issues",
+    "email": "hello@edgekits.dev"
+  },
+  "keywords": [
+    "github",
+    "stripe",
+    "webhook",
+    "cloudflare-workers",
+    "paywall",
+    "self-hosted",
+    "hono",
+    "open-core"
+  ],
+  "exports": {
+    ".": "./src/lib.ts",
+    "./adapters/stripe": "./src/adapters/stripe.ts",
+    "./wizard": {
+      "types": "./scripts/wizard.d.mts",
+      "default": "./scripts/wizard.mjs"
+    }
+  },
+  "files": [
+    "src",
+    "scripts/wizard.mjs",
+    "scripts/wizard.d.mts",
+    "!src/config/repoaccess.config.ts",
+    "!src/index.ts",
+    "!src/index.production.ts",
+    "docs/setup-guide.md",
+    "docs/user-guide-stripe.md",
+    "CHANGELOG.md",
+    "README.md",
+    "LICENSE",
+    "LICENSING.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md"
+  ],
+  "scripts": {
+    "dev": "wrangler dev --env=\"\"",
+    "deploy:sandbox": "wrangler deploy --minify --env=\"\" --secrets-file .dev.vars",
+    "deploy:production": "wrangler deploy --minify --env production --secrets-file .dev.vars.production",
+    "typegen": "wrangler types --env-interface CloudflareBindings",
+    "bootstrap": "node scripts/bootstrap-dev.mjs",
+    "pretypecheck": "node scripts/bootstrap-dev.mjs",
+    "typecheck": "tsc --noEmit",
+    "pretest": "node scripts/bootstrap-dev.mjs",
+    "test": "vitest run",
+    "format": "prettier --write .",
+    "wizard:drive": "node scripts/wizard-driver.mjs"
+  },
+  "peerDependencies": {
+    "hono": "^4"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.19.1",
+    "@types/node": "26.1.1",
+    "hono": "4.12.34",
+    "prettier": "3.9.5",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10",
+    "wrangler": "4.116.0"
+  },
+  "overrides": {
+    "sharp": "0.35.3",
+    "undici": "7.29.0"
+  },
+  "allowScripts": {
+    "esbuild": false,
+    "sharp": false,
+    "workerd": false,
+    "fsevents": false
+  }
+}

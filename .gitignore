@@ -1,0 +1,58 @@
+# prod
+dist/
+
+# dev
+.yarn/
+!.yarn/releases
+.vscode/*
+!.vscode/launch.json
+!.vscode/*.code-snippets
+.idea/workspace.xml
+.idea/usage.statistics.xml
+.idea/shelf
+
+# deps
+node_modules/
+.wrangler
+
+# env
+.env
+.env.production
+.dev.vars
+
+# logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# misc
+.DS_Store
+*.stackdump
+
+.dev.vars*
+!.dev.vars.example
+!.dev.vars.production.example
+!.env.example
+
+# dev-local agent settings - one machine's own overrides; the committed .claude/settings.json is what ships
+.claude/settings.local.json
+
+# live deployer config - copied from src/config/repoaccess.config.example.ts (survives updates; see that file)
+src/config/repoaccess.config.ts
+
+# live wrangler config - copied from wrangler.jsonc.example (survives updates; see that file)
+wrangler.jsonc
+
+# setup-wizard driver run state - one deployer's in-progress answers, never committed
+.wizard-driver-state.json
+
+# internal security audit reports - kept locally, never published
+audit/
+.fallow/
+
+# scratch trees the env-typegen parity guard builds and removes
+.envguard/
