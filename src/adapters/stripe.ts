@@ -73,6 +73,60 @@ interface StripeEvent {
   data?: { object?: Record<string, unknown> }
 }
 
+function readEvent(raw: RawRequest): StripeEvent | null {
+  try {
+    return JSON.parse(raw.bodyText) as StripeEvent
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The grant a paid Checkout Session makes. Shared by `checkout.session.completed` and
+ * `checkout.session.async_payment_succeeded`, so a purchase paid by a delayed method grants exactly
+ * what an instantly paid one does: same transaction id, product, email, handle and redirect alias,
+ * and therefore the same Workflow instance id.
+ */
+function paidSession(object: Record<string, unknown>): NormalizedEvent | null {
+  // Gate: nothing is granted for a session whose money has not settled.
+  if (object.payment_status !== 'paid') return null
+  // transaction_id = payment_intent (stable across the order + its refund/dispute), NOT
+  // checkout.session.id (absent from charge events).
+  const transactionId = asString(object.payment_intent)
+  if (!transactionId) return null
+  const customer = object.customer_details as
+    Record<string, unknown> | undefined
+  return {
+    event_type: 'payment_success',
+    product_id: productId(object),
+    transaction_id: transactionId,
+    buyer_email: asString(customer?.email) ?? asString(object.customer_email),
+    github_username: githubUsername(object),
+    is_full_refund: null,
+    // The success_url redirect carries the checkout session id (cs_...), not the
+    // payment_intent. Alias it -> transaction_id so /claim/by-txn resolves from the redirect.
+    redirect_alias_id: asString(object.id) ?? undefined, // cs_... (checkout session id)
+  }
+}
+
+/**
+ * Why a verified Checkout event is acknowledged with nothing to do, or null when it is not one of
+ * those. These are recognised events whose correct outcome is "no grant": answering them 400 would
+ * make Stripe retry a right decision for days.
+ */
+function nothingToGrant(event: StripeEvent): string | null {
+  const status = event.data?.object?.payment_status
+  if (event.type === 'checkout.session.completed') {
+    // A delayed payment method (a bank debit, a voucher) completes the session before the money
+    // settles; `async_payment_succeeded` follows when it does.
+    if (status === 'unpaid') return 'payment not settled yet'
+    if (status === 'no_payment_required') return 'no payment required'
+  }
+  if (event.type === 'checkout.session.async_payment_failed')
+    return 'delayed payment failed'
+  return null
+}
+
 export const stripe: PaymentAdapter = {
   name: 'stripe',
 
@@ -95,39 +149,42 @@ export const stripe: PaymentAdapter = {
     toleranceSec: TOLERANCE_SEC,
   },
 
+  // Runs after verification and before parse. It claims only the recognised Checkout events whose
+  // outcome is "no grant" and acknowledges them 200 without an enqueue; every other body (including
+  // malformed JSON and event types this adapter does not know) returns null and falls through to
+  // `parse` untouched, which still answers those 400.
+  handle: async (raw: RawRequest): Promise<Response | null> => {
+    const event = readEvent(raw)
+    if (!event) return null
+    const reason = nothingToGrant(event)
+    if (!reason) return null
+    console.log(
+      JSON.stringify({
+        level: 'info',
+        msg: 'stripe webhook acknowledged, nothing to grant',
+        event_type: event.type,
+        reason,
+      }),
+    )
+    return new Response('ok', { status: 200 })
+  },
+
   parse: (raw: RawRequest): NormalizedEvent | null => {
-    let event: StripeEvent
-    try {
-      event = JSON.parse(raw.bodyText) as StripeEvent
-    } catch {
-      return null
-    }
+    const event = readEvent(raw)
+    if (!event) return null
     const object = event.data?.object
     if (typeof event.type !== 'string' || !object) return null
 
     switch (event.type) {
-      case 'checkout.session.completed': {
-        // Gate: a session can fire before the async payment settles for some methods.
-        if (object.payment_status !== 'paid') return null
-        // transaction_id = payment_intent (stable across the order + its refund/dispute), NOT
-        // checkout.session.id (absent from charge events).
-        const transactionId = asString(object.payment_intent)
-        if (!transactionId) return null
-        const customer = object.customer_details as
-          Record<string, unknown> | undefined
-        return {
-          event_type: 'payment_success',
-          product_id: productId(object),
-          transaction_id: transactionId,
-          buyer_email:
-            asString(customer?.email) ?? asString(object.customer_email),
-          github_username: githubUsername(object),
-          is_full_refund: null,
-          // The success_url redirect carries the checkout session id (cs_...), not the
-          // payment_intent. Alias it -> transaction_id so /claim/by-txn resolves from the redirect.
-          redirect_alias_id: asString(object.id) ?? undefined, // cs_... (checkout session id)
-        }
-      }
+      case 'checkout.session.completed':
+        return paidSession(object)
+
+      // A delayed payment method has settled. It builds the same event - and so the same
+      // `stripe-payment_success-<payment_intent>` instance id - as a paid `completed` for this session,
+      // so if a seller's endpoint ever receives both for one purchase, the second enqueue is deduped
+      // by that id and the buyer is granted once.
+      case 'checkout.session.async_payment_succeeded':
+        return paidSession(object)
 
       case 'charge.refunded': {
         const transactionId = asString(object.payment_intent)

@@ -335,7 +335,7 @@ const webhookSecret = (
   env,
 ) => `Create the webhook: **Developers -> Webhooks (Event destinations) -> Add destination**. Stripe's current flow selects the EVENTS FIRST, then the endpoint:
 
-- Events - send exactly these three: \`checkout.session.completed\`, \`charge.refunded\`, \`charge.dispute.created\`.
+- Events - send exactly these four: \`checkout.session.completed\`, \`checkout.session.async_payment_succeeded\`, \`charge.refunded\`, \`charge.dispute.created\`.
 - **Configure destination -> Endpoint URL:** \`https://YOUR-WORKER-URL/wh/stripe/YOUR-SECRET-PATH\` _(I generated the path - obscurity only, the worker doesn't validate it)_.
 
 Create it, then reveal the **Signing secret** (\`whsec_...\`) with the eye icon and copy it. Open **\`${secretsFileFor(env)}\`** and paste it on its own line, no spaces around the \`=\`:
@@ -402,17 +402,20 @@ Next up is a synthetic check - I'll give the brand-new worker's workflow a minut
 // affordance in the released money path, and this check already IS the full ping.
 const WORKFLOW_REGISTER_PAUSE_MS = 45_000
 
-// The synthetic check sends ONE signed `checkout.session.completed` and proves the GRANT path. The
-// cleanup is the CHECK's own direct GitHub DELETE - it never sends `charge.refunded`, so the worker's
-// revoke path is not exercised here, and the wording says so. A Full run is what tests refunds.
+// The synthetic check sends ONE signed `checkout.session.completed`, then ONE signed full refund of the
+// SAME transaction, so the worker both grants and withdraws - which is what makes the check clean up
+// through the worker instead of around it, and proves the revoke path while it is at it. The direct
+// GitHub cancel and KV delete stay behind that as belt and braces. What it still does NOT exercise: the
+// CLAIM path (it always sends a username), and real money - a Full run buys and refunds in the Stripe
+// dashboard. The wording says exactly that and no more.
 const syntheticCheck = (
   goal,
-) => `Running a quick synthetic check, so nothing surprises you: I build a fake but correctly-signed Stripe event and send it to your worker, which sends a **real** GitHub invite to \`TEST-HANDLE\`; the check then cancels it automatically. One invite email, one cancellation - no money, nothing to accept...
+) => `Running a quick synthetic check, so nothing surprises you: I build a fake but correctly-signed Stripe event and send it to your worker, which sends a **real** GitHub invite to \`TEST-HANDLE\`; I then send a matching refund, which is what makes your worker take the invite back. One invite email, one cancellation - no money, nothing to accept...
 
 Synthetic check **green**. ${
   goal === 'full'
     ? "Now let's do it for real."
-    : "Your grant path works end to end - a signed event in, a real GitHub invite out. Refunds aren't tested here; a Full run does that."
+    : 'Your grant path and your revoke path both work end to end - a signed event in, a real GitHub invite out, a refund in, the invite gone. No real money moved; a Full run buys and refunds for real.'
 }`
 
 const PURCHASE = `Open your Payment Link and buy the product with Stripe's test card:
@@ -626,17 +629,17 @@ ${TOKEN_EXPIRY_REMINDER}`
 
 const closingQuickSandbox = (
   repoAttached,
-) => `Done - your sandbox worker is deployed on \`workers.dev\`, and the synthetic test proved the grant path end to end: a signed event in, a real GitHub invite out, then cleaned up.
+) => `Done - your sandbox worker is deployed on \`workers.dev\`, and the synthetic test proved the grant and revoke paths end to end: a signed event in, a real GitHub invite out, a refund in, the invite gone.
 
-**What this run did NOT do:** it didn't touch Stripe, prove a real purchase, or test the refund path - a Quick check skips the dashboard on purpose. So this isn't a selling setup, and nothing here can take money.
+**What this run did NOT do:** it didn't touch Stripe or prove a real purchase - the refund it sent was synthetic, not money coming back through Stripe. A Quick check skips the dashboard on purpose. So this isn't a selling setup, and nothing here can take money.
 
 **When you're ready to sell:** run this wizard again as a **Full setup** - it wires Stripe and proves a real test purchase - then set up **Production** and go live. See \`docs/user-guide-stripe.md\`.
 
 ${closingReminders(repoAttached)}`
 
-const CLOSING_QUICK_PRODUCTION = `Done - your production worker is deployed on \`YOUR-DOMAIN\`, and the synthetic test proved the grant path end to end.
+const CLOSING_QUICK_PRODUCTION = `Done - your production worker is deployed on \`YOUR-DOMAIN\`, and the synthetic test proved the grant and revoke paths end to end.
 
-**What this run did NOT do:** it didn't touch Stripe, prove a real purchase, or test the refund path - a Quick check skips the dashboard. Nothing here can take money yet.
+**What this run did NOT do:** it didn't touch Stripe or prove a real purchase - the refund it sent was synthetic, not money coming back through Stripe. A Quick check skips the dashboard. Nothing here can take money yet.
 
 **To sell:** run a **Full setup** to wire Stripe and prove a real test purchase, then go live in your **live** Stripe dashboard. See \`docs/user-guide-stripe.md\`, "Going live".
 
@@ -1553,10 +1556,11 @@ async function probeWorkerUrl(state, deps) {
   return { subdomainCandidate: candidate?.subdomain ?? null }
 }
 
-// The synthetic check's own transaction ids. `e2e` mints `pi_e2e_<uuid>`. Its cleanup DOES delete the
-// grant record it wrote, but that delete is advisory (a failed delete never reds a green check), so a
-// `pi_e2e_` grant CAN still be sitting in KV at a refund screen. Filtering these out (belt-and-braces
-// over the cleanup) is what keeps the refund screen from naming a synthetic id the deployer cannot refund.
+// The synthetic check's own transaction ids. `e2e` mints `pi_e2e_<uuid>`. Its synthetic refund makes the
+// WORKER delete the grant record, and a direct delete follows as belt and braces - but the refund is
+// skipped on a `log_only` product and the direct delete is advisory (a failed one never reds a green
+// check), so a `pi_e2e_` grant CAN still be sitting in KV at a refund screen. Filtering these out is what
+// keeps the refund screen from naming a synthetic id the deployer cannot refund.
 const E2E_TXN_PREFIX = 'pi_e2e_'
 
 // The transaction ids in the store that could be a payment this deployer can actually refund: this
@@ -1835,7 +1839,7 @@ const RECOVERY = {
     },
     {
       when: 'wrong events selected',
-      text: 'Send exactly these three: `checkout.session.completed`, `charge.refunded`, `charge.dispute.created`. Fewer, and refunds or chargebacks never reach the worker; more is just noise it answers `400` to.',
+      text: 'Send exactly these four: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `charge.refunded`, `charge.dispute.created`. Fewer, and buyers who pay with a delayed method (a bank debit or a voucher) are never granted, or refunds and chargebacks never reach the worker; more is just noise it does not act on.',
     },
     {
       when: 'the endpoint URL is wrong',
@@ -1919,6 +1923,10 @@ const RECOVERY = {
     {
       when: 'no invite right after the FIRST deploy',
       text: 'On a brand-new worker the Workflows engine can lag the deploy by a minute or two - the event is accepted, but the workflow errors before its first step ("Worker not found" in the Cloudflare dashboard). Nothing is misconfigured: wait another minute, then type **done** to retry.',
+    },
+    {
+      when: 'the invite appeared but the refund did not take it back',
+      text: "The grant half worked and the revoke half did not, which is the half a refund uses. If the worker refused the refund event, the deploy is running code older than your config - deploy again. If it accepted it and the test buyer stayed in the team, check the worker logs for the revoke and confirm the product's revoke policy is `auto_revoke` - a `log_only` product keeps access on a refund by design, and the check says so rather than failing.",
     },
     {
       when: 'no invite appeared',
@@ -2127,7 +2135,7 @@ const SCREENS = [
           value: 'quick',
           label: 'Quick check',
           description:
-            'deploy the worker and run a synthetic end-to-end test that proves the grant path: a signed event resolves to a team and produces a real GitHub invite. It does not test refunds - a Full run does that. No Stripe dashboard, faster. Choose this to verify the wiring.',
+            'deploy the worker and run a synthetic end-to-end test that proves the grant and revoke paths: a signed event resolves to a team and produces a real GitHub invite, and a signed refund takes it back. No real money moves and no Stripe dashboard - a Full run buys and refunds for real. Faster. Choose this to verify the wiring.',
         },
       ],
     }),

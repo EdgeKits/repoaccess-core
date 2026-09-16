@@ -348,8 +348,8 @@ const ClaimGranted = (props: { brand: Branding }) => (
   <Layout brand={props.brand} title="Access granted">
     <h2>Access granted</h2>
     <p>
-      Your access is set up. Check your email for the GitHub invitation and
-      accept it.
+      Your access is set up. Check your email and your GitHub notifications for
+      the invitation, and accept it.
     </p>
   </Layout>
 )

@@ -38,8 +38,13 @@ export interface EventEnvelope {
    */
   origin?: GrantOrigin
   // Per-event fields: github_username (string|null), teams (string[]), status/reason/claim_url/
-  // trigger (string). A flat scalar/array union - not a recursive JSON type - keeps the envelope
-  // Serializable cheaply across the `step.do` boundary that emits it (avoids TS2589).
+  // trigger (string), sequence (number). A flat scalar/array union - not a recursive JSON type - keeps
+  // the envelope Serializable cheaply across the `step.do` boundary that emits it (avoids TS2589).
+  //
+  // `sequence` rides on `access.granted`, `access.revoked` and an `access.failed` whose reason is
+  // `transaction_revoked`. It is minted by the per-transaction guard for the transition that decided
+  // the event, so for one transaction the event with the higher `sequence` is the current state,
+  // whatever order deliveries arrive in. `timestamp` is when the event was sent, not an ordering key.
   //
   // The `| undefined` is what lets the OPTIONAL `origin` above sit under this signature at all; it
   // is deliberately not folded into `EnvelopeField`, so an `extra` a caller passes stays strict.
@@ -47,7 +52,7 @@ export interface EventEnvelope {
 }
 
 /** Value type for an envelope's per-event extra fields (see the index signature above). */
-export type EnvelopeField = string | string[] | null
+export type EnvelopeField = string | number | string[] | null
 
 /**
  * Build the base envelope + per-type fields. event_id is THIS delivery's id (not the txn).

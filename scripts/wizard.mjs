@@ -2155,6 +2155,29 @@ export function buildE2eEvent({ productId, username, transactionId }) {
   }
 }
 
+// Build the SYNTHETIC Stripe FULL REFUND of that same purchase - the event the check sends to undo its
+// own grant through the worker rather than around it. It mirrors the payment above: same transaction
+// (the `payment_intent` is what correlates an order with its refund), same product. `amount_refunded`
+// equals `amount` because only a FULL refund is unambiguous - a partial one is skipped by a product
+// configured `full_refund_only`, so the check would prove nothing on half the configurations.
+export function buildE2eRefundEvent({ productId, username, transactionId }) {
+  return {
+    id: `evt_e2e_refund_${transactionId}`,
+    type: 'charge.refunded',
+    data: {
+      object: {
+        id: `ch_e2e_${transactionId}`,
+        object: 'charge',
+        payment_intent: transactionId,
+        amount: 100,
+        amount_refunded: 100,
+        metadata: { github_username: username, product_id: productId },
+        billing_details: { email: 'e2e@repoaccess.test' },
+      },
+    },
+  }
+}
+
 // The exact Stripe-Signature the adapter's hmac verify accepts: `t=<unix>,v1=<hex>` over the signed
 // payload `${t}.${body}`, HMAC-SHA256 keyed by STRIPE_WEBHOOK_SECRET, byte-exact on the raw body.
 export function stripeSignatureHeader(body, secret, timestamp) {
@@ -2191,11 +2214,16 @@ export function stripeSignatureHeader(body, secret, timestamp) {
 //   buildEvent       ({ productId, username, transactionId }) -> the event object to sign and send.
 //   signatureHeader  (body, secret, timestamp) -> { name, value }. Both halves are provider-specific:
 //                    the header NAME differs per provider as much as the signing scheme does.
+//   buildRefundEvent OPTIONAL. Same arguments, returning that provider's FULL REFUND of the same
+//                    transaction. It is what lets the check undo its own grant through the worker
+//                    instead of around it. A pack that omits it still works: the synthetic refund is
+//                    skipped with a visible warning naming what is left behind.
 
 export const STRIPE_E2E_PACK = {
   webhookPath: 'stripe',
   secretName: 'STRIPE_WEBHOOK_SECRET',
   buildEvent: buildE2eEvent,
+  buildRefundEvent: buildE2eRefundEvent,
   signatureHeader: (body, secret, timestamp) => ({
     name: 'stripe-signature',
     value: stripeSignatureHeader(body, secret, timestamp),
@@ -2223,8 +2251,11 @@ export function resolveE2ePack(pack) {
   if (missing.length > 0) {
     return { error: `provider pack is missing: ${missing.join(', ')}` }
   }
-  const notFn = ['buildEvent', 'signatureHeader'].filter(
-    (f) => typeof pack[f] !== 'function',
+  // `buildRefundEvent` is optional, so it is checked only when supplied - a pack that omits it is
+  // complete, a pack that supplies something uncallable is a caller bug and says so here rather than
+  // mid-cleanup.
+  const notFn = ['buildEvent', 'signatureHeader', 'buildRefundEvent'].filter(
+    (f) => pack[f] !== undefined && typeof pack[f] !== 'function',
   )
   if (notFn.length > 0) {
     return {
@@ -2251,6 +2282,23 @@ export function resolveE2eProduct(config, adapter = 'stripe') {
     }
   }
   return null
+}
+
+/**
+ * Would a refund of this product actually WITHDRAW the grant, under the config this run deployed?
+ *
+ * The resolution mirrors the worker's exactly - `map[adapter][product]`, falling back to the whole
+ * `defaults` object - and so does the fallback when a product names no policy: the worker treats an
+ * absent `revoke_policy` as `log_only`, so this does too. `full_refund_only` needs no branch here
+ * because the synthetic refund is always a full one.
+ *
+ * The check asks because a `log_only` product is CONFIGURED not to lose access on a refund. Sending
+ * the synthetic refund anyway would prove nothing and then wait for a removal that is never coming.
+ */
+export function e2eRevokesOnRefund(config, adapter, productId) {
+  const map = config?.productTeamMap ?? {}
+  const product = map?.[adapter]?.[productId] ?? map.defaults
+  return (product?.revoke_policy?.mode ?? 'log_only') === 'auto_revoke'
 }
 
 const enc = encodeURIComponent
@@ -2298,6 +2346,26 @@ async function pollForInvite(doFetch, token, org, team, username, opts) {
   return false
 }
 
+// The mirror of pollForInvite: poll the same membership until it is GONE (404) or the bounded window
+// ends. It is what "the worker revoked it" looks like from outside - the same endpoint, the same
+// budget, read the other way round.
+async function pollForRemoval(doFetch, token, org, team, username, opts) {
+  const attempts = opts.pollAttempts ?? 10
+  const sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)))
+  const intervalMs = opts.pollIntervalMs ?? 3000
+  for (let i = 0; i < attempts; i++) {
+    const res = await ghRequest(
+      doFetch,
+      token,
+      'GET',
+      `/orgs/${enc(org)}/teams/${enc(team)}/memberships/${enc(username)}`,
+    )
+    if (res.status === 404) return true
+    if (i < attempts - 1) await sleep(intervalMs)
+  }
+  return false
+}
+
 // Cancel the invite EVERYWHERE (idempotent): remove each team membership (404 = already gone), then
 // cancel any pending org invitation for the handle. Best-effort on the invitations list.
 async function cancelInvite(doFetch, token, org, teams, username) {
@@ -2333,10 +2401,163 @@ async function cancelInvite(doFetch, token, org, teams, username) {
   return ok
 }
 
+// Sign one event with the pack's scheme and POST it at the worker's webhook route. Shared by the
+// synthetic payment and the synthetic refund so the two are byte-identical in everything except the
+// body: same route, same header, same browser UA (see BROWSER_UA - a zone rule that refuses one would
+// refuse the other, and a half-wired probe would report that as a broken revoke path).
+function postPackEvent(
+  doFetch,
+  { url, pack, secretPath, providerSecret, timestamp, body },
+) {
+  const signature = pack.signatureHeader(body, providerSecret, timestamp)
+  return doFetch(
+    `${url.replace(/\/$/, '')}/wh/${enc(pack.webhookPath)}/${enc(secretPath)}`,
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        [signature.name]: signature.value,
+        'user-agent': BROWSER_UA,
+      },
+      body,
+    },
+  )
+}
+
+/**
+ * Undo the synthetic grant the way a real refund does: a signed FULL REFUND for the same transaction,
+ * over the same route, waited on the same way.
+ *
+ * WHY THIS EXISTS. The grant the check just made put state in three places the WORKER owns: the GitHub
+ * invitation, the KV grant record, and - inside the guard Durable Object - the transaction's status
+ * plus the buyer's ledger entry saying that transaction entitles the team. Cancelling the invitation
+ * against GitHub and deleting the record with a raw KV delete reaches two of those and leaves the guard
+ * saying `granted` and the ledger still counting the transaction. The deployer's own refund test then
+ * correctly keeps a team a phantom purchase still entitles, and reads as a broken revoke path on a
+ * worker that is behaving exactly as designed. State the worker owns is changed only through the worker.
+ *
+ * It returns ONE check, because the deployer either got proof of the revoke path or did not. Four ways
+ * not to, each naming what is left behind instead of failing quietly, and none of them throwing:
+ *   - the pack describes no refund event (a downstream provider that has not supplied one),
+ *   - the product's revoke policy is not `auto_revoke`, so a refund is MEANT to keep access,
+ *   - the worker never acked the payment, so there is no grant to withdraw,
+ *   - no invitation was ever observed, so no removal can prove anything.
+ */
+async function syntheticRevoke(ctx) {
+  const {
+    doFetch,
+    pack,
+    url,
+    secretPath,
+    providerSecret,
+    githubToken,
+    org,
+    teams,
+    pollTeam,
+    username,
+    productId,
+    transactionId,
+    timestamp,
+    revokes,
+    ackOk,
+    invited,
+    opts,
+  } = ctx
+  // The refund is signed with a FRESH timestamp, not the payment's. A provider that carries a timestamp
+  // in its signature rejects one outside its replay window, and by now the payment's is as old as the
+  // invite poll took - default ~30s, and arbitrarily longer for a caller that widened the poll. Re-using
+  // it would eventually earn a 401 the check would report as "the worker refused the refund", which is a
+  // wrong diagnosis of a right worker. A caller that PINNED `opts.timestamp` still gets that one, because
+  // a pinned clock is what makes a signature assertion reproducible.
+  const refundTimestamp = opts.timestamp ?? Math.floor(Date.now() / 1000)
+  const name = `synthetic refund revoked the grant through the worker (${pollTeam})`
+  // The state a skipped revoke leaves on the worker, in the deployer's terms. Named in every skip,
+  // because "skipped" on its own does not tell anyone what to expect from their next refund test.
+  const leftBehind = `The synthetic purchase ${transactionId} stays on the books: the worker still counts it as entitling ${teams.join(', ')} for ${username}, so a later refund of a REAL purchase by ${username} will correctly keep those teams.`
+  const skip = (reason) => ({ name, ok: false, severity: 'warn', fix: reason })
+
+  if (typeof pack.buildRefundEvent !== 'function') {
+    return skip(
+      `This provider pack describes no refund event, so the worker's revoke path was not exercised. ${leftBehind} Give the pack a buildRefundEvent that returns a full refund of the same transaction to prove the revoke path and clean up through the worker.`,
+    )
+  }
+  if (!revokes) {
+    return skip(
+      `The product's revoke policy is not auto_revoke, so a refund is meant to KEEP access and there is nothing for a synthetic refund to prove. ${leftBehind} Nothing to fix if log_only is what you chose.`,
+    )
+  }
+  if (!ackOk) {
+    return skip(
+      `The worker never acked the synthetic payment, so there is no grant to withdraw and the revoke path was not exercised. Fix the failure above and run the check again.`,
+    )
+  }
+
+  let res
+  try {
+    res = await postPackEvent(doFetch, {
+      url,
+      pack,
+      secretPath,
+      providerSecret,
+      timestamp: refundTimestamp,
+      body: JSON.stringify(
+        pack.buildRefundEvent({ productId, username, transactionId }),
+      ),
+    })
+  } catch {
+    return {
+      name,
+      ok: false,
+      fix: `Could not reach the deployed worker at ${url} to send the synthetic refund - confirm the URL and that it is deployed, then run the check again. ${leftBehind}`,
+    }
+  }
+  if (!(res.status >= 200 && res.status < 300)) {
+    return {
+      name,
+      ok: false,
+      fix: `The worker accepted the synthetic payment but refused the synthetic refund (status ${res.status}). Its refund events are what a real refund arrives as, so refunds would not revoke either. ${leftBehind}`,
+    }
+  }
+  if (!invited) {
+    return skip(
+      `The synthetic refund was accepted, but no invitation had appeared for it to withdraw, so the revoke path is unproven. Fix the missing invite above and run the check again.`,
+    )
+  }
+
+  // Guarded like the POST above, and for a reason that is not symmetry: this whole function runs inside
+  // the cleanup's `finally`, BEFORE the direct invite cancel, so a throw escaping here would take the
+  // cleanup with it and leave the dangling invite the `finally` exists to prevent.
+  let removed = false
+  try {
+    removed = await pollForRemoval(
+      doFetch,
+      githubToken,
+      org,
+      pollTeam,
+      username,
+      opts,
+    )
+  } catch {
+    return {
+      name,
+      ok: false,
+      fix: `The worker accepted the synthetic refund, but GitHub could not be reached to confirm ${username} was removed from ${pollTeam}, so the revoke is unconfirmed rather than failed. Check https://github.com/orgs/${org}/people/pending_invitations and run the check again.`,
+    }
+  }
+  if (!removed) {
+    return {
+      name,
+      ok: false,
+      fix: `The worker accepted the synthetic refund, but ${username} is still in ${pollTeam} after the poll window - so a real refund would not remove a buyer either. Check the worker logs for the revoke instance (the token needs member-management on the org). ${leftBehind}`,
+    }
+  }
+  return { name, ok: true }
+}
+
 // e2e - the synthetic Stripe grant chain: build + sign + POST to the deployed worker, poll
-// GitHub for the invite, and ALWAYS cancel it (finally). Secrets are read by the script and used only
-// in headers, never printed. Every leg is a check; the injectable fetch / secret / clock seams make
-// the whole flow mock-testable with no network.
+// GitHub for the invite, then withdraw it the same way a refund does and ALWAYS clean up (finally).
+// Secrets are read by the script and used only in headers, never printed. Every leg is a check; the
+// injectable fetch / secret / clock seams make the whole flow mock-testable with no network.
 export async function e2e(opts = {}) {
   const cwd = opts.cwd ?? process.cwd()
   const env = opts.env ?? null
@@ -2452,26 +2673,28 @@ export async function e2e(opts = {}) {
   const pollTeam = teams[0]
 
   const checks = []
+  // Hoisted out of the try: the cleanup below has to know how far the chain got, and a POST that threw
+  // leaves both of these false, which is exactly the answer the synthetic refund needs.
+  let ackOk = false
+  let invited = false
   try {
-    const body = JSON.stringify(
-      pack.buildEvent({ productId: target.productId, username, transactionId }),
-    )
-    const signature = pack.signatureHeader(body, providerSecret, timestamp)
-    const ackRes = await doFetch(
-      `${url.replace(/\/$/, '')}/wh/${enc(pack.webhookPath)}/${enc(secretPath)}`,
-      {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          [signature.name]: signature.value,
-          'user-agent': BROWSER_UA,
-        },
-        body,
-      },
-    )
+    const ackRes = await postPackEvent(doFetch, {
+      url,
+      pack,
+      secretPath,
+      providerSecret,
+      timestamp,
+      body: JSON.stringify(
+        pack.buildEvent({
+          productId: target.productId,
+          username,
+          transactionId,
+        }),
+      ),
+    })
     checks.push({ name: 'synthetic webhook signed and posted', ok: true })
 
-    const ackOk = ackRes.status >= 200 && ackRes.status < 300
+    ackOk = ackRes.status >= 200 && ackRes.status < 300
     checks.push({
       name: 'worker ack (2xx)',
       ok: ackOk,
@@ -2483,7 +2706,7 @@ export async function e2e(opts = {}) {
     })
 
     if (ackOk) {
-      const invited = await pollForInvite(
+      invited = await pollForInvite(
         doFetch,
         githubToken,
         org,
@@ -2508,16 +2731,43 @@ export async function e2e(opts = {}) {
       fix: `Could not reach the deployed worker at ${url} - confirm the URL and that it is deployed`,
     })
   } finally {
-    // ALWAYS clean up - a failed e2e must never leave a dangling invite.
-    const cleaned = await cancelInvite(
-      doFetch,
-      githubToken,
-      org,
-      teams,
-      username,
+    // ALWAYS clean up - a failed e2e must never leave a dangling invite. The order is the point: the
+    // worker withdraws its own grant FIRST (which also proves the revoke path), and the two direct
+    // calls below are belt and braces for whatever that could not reach.
+    checks.push(
+      await syntheticRevoke({
+        doFetch,
+        pack,
+        url,
+        secretPath,
+        providerSecret,
+        githubToken,
+        org,
+        teams,
+        pollTeam,
+        username,
+        productId: target.productId,
+        transactionId,
+        timestamp,
+        revokes: e2eRevokesOnRefund(config, pack.webhookPath, target.productId),
+        ackOk,
+        invited,
+        opts,
+      }),
     )
+
+    // Guarded, because `ghRequest` awaits `doFetch` bare and a network error here would escape the
+    // `finally` and take the whole step's result with it - the run would end with an exception instead of
+    // a check list, on a check whose entire job is to report. An unreachable GitHub reads the same as a
+    // refused DELETE: not cleaned, with the link to do it by hand.
+    let cleaned = false
+    try {
+      cleaned = await cancelInvite(doFetch, githubToken, org, teams, username)
+    } catch {
+      cleaned = false
+    }
     checks.push({
-      name: 'cleanup: invite cancelled',
+      name: 'cleanup: invite cancelled directly (belt and braces)',
       ok: cleaned,
       ...(cleaned
         ? {}
@@ -2526,12 +2776,12 @@ export async function e2e(opts = {}) {
           }),
     })
 
-    // Also delete the synthetic grant record this run minted (grant:<adapter>:<transaction_id>). A grant
-    // that fired wrote it to the REMOTE ENTITLEMENTS store; leaving it behind means synthetic data sits
-    // in a production KV and grant-record later lists a phantom pi_ the operator has to disambiguate for
-    // the refund test. Same --remote / env-aware wrangler invocation grant-record uses. Advisory (WARN):
-    // a failed delete (e.g. when the ack failed and no record was ever written) must never turn a green
-    // e2e red.
+    // Belt and braces for the grant record (grant:<adapter>:<transaction_id>). A synthetic refund that
+    // revoked deletes it already - this covers the runs where the refund was skipped or did not land,
+    // so synthetic data never sits in a production KV and grant-record never lists a phantom pi_ the
+    // operator has to disambiguate for the refund test. Same --remote / env-aware wrangler invocation
+    // grant-record uses. Advisory (WARN): a failed delete (the key is usually gone by now) must never
+    // turn a green e2e red.
     const grantKey = `grant:${pack.webhookPath}:${transactionId}`
     const delRes = run([
       'kv',
@@ -2544,7 +2794,7 @@ export async function e2e(opts = {}) {
       ...(env ? ['--env', env] : []),
     ])
     checks.push({
-      name: `cleanup: synthetic grant record deleted (${grantKey})`,
+      name: `cleanup: synthetic grant record deleted directly (belt and braces, ${grantKey})`,
       ok: delRes.ok,
       severity: 'warn',
       ...(delRes.ok

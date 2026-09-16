@@ -43,11 +43,22 @@ export interface CreateWorkerOptions {
  * distribution composes `[stripe, …]` with a longer adapter list. The router code is identical - only
  * the adapter list differs. No provider-specific branches live here.
  */
+/** The adapter name the buyer ledger's addressing takes (see `createWorker`). */
+const RESERVED_ADAPTER_NAME = 'buyer'
+
 export function createWorker({
   adapters,
   config,
   claimTemplate = defaultClaimTemplate,
 }: CreateWorkerOptions) {
+  // `buyer` is reserved. The claim guard's namespace addresses each buyer's ledger as `buyer:{login}`
+  // beside each transaction's guard at `{adapter}:{transaction_id}`, so an adapter of that name could
+  // resolve a transaction to a buyer's ledger. Refused here, at construction, before anything is served.
+  if (adapters.some((adapter) => adapter.name === RESERVED_ADAPTER_NAME)) {
+    throw new Error(
+      `createWorker: the adapter name "${RESERVED_ADAPTER_NAME}" is reserved - it is taken by the buyer ledger. Give the adapter another name.`,
+    )
+  }
   const adaptersByName = new Map(
     adapters.map((adapter) => [adapter.name, adapter]),
   )

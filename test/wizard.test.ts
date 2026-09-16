@@ -21,9 +21,11 @@ import {
   e2e,
   resolveUrl,
   buildE2eEvent,
+  buildE2eRefundEvent,
   stripeSignatureHeader,
   resolveE2eProduct,
   resolveE2ePack,
+  e2eRevokesOnRefund,
   STRIPE_E2E_PACK,
   collectTeams,
   parseJsonc,
@@ -2598,26 +2600,40 @@ function e2eFetch(
   return fn as any
 }
 
+// What the wizard actually writes: one product, one team, and an EXPLICIT revoke policy. `auto_revoke`
+// is not decoration here - it is what makes a refund withdraw the grant, so it is what the synthetic
+// refund leg of the check has to prove.
 const E2E_CONFIG = {
   githubOrg: 'acme',
   productTeamMap: {
     defaults: { teams: [] },
-    stripe: { prod_x: { teams: ['pro'] } },
+    stripe: {
+      prod_x: { teams: ['pro'], revoke_policy: { mode: 'auto_revoke' } },
+    },
   },
   e2e: { testUsername: 'octocat', url: 'https://worker.example' },
 }
 
-// Happy-path routes: ack 2xx, membership pending, empty invitation list, deletes succeed.
-const greenE2eFetch = () =>
-  e2eFetch((method, url) => {
-    if (url.includes('/wh/stripe/')) return { status: 200 }
+// Happy-path routes for a worker that GRANTS on the payment and REVOKES on the synthetic refund: ack
+// 2xx, membership pending until the second webhook lands, gone after it, empty invitation list, deletes
+// succeed. The membership flip is the fixture's whole job - it is what the check now measures.
+const greenE2eFetch = () => {
+  let webhooks = 0
+  return e2eFetch((method, url) => {
+    if (url.includes('/wh/stripe/')) {
+      webhooks += 1
+      return { status: 200 }
+    }
     if (method === 'GET' && url.includes('/teams/pro/memberships/octocat'))
-      return { status: 200, json: { state: 'pending' } }
+      return webhooks > 1
+        ? { status: 404 }
+        : { status: 200, json: { state: 'pending' } }
     if (method === 'GET' && url.includes('/invitations'))
       return { status: 200, json: [] }
     if (method === 'DELETE') return { status: 204 }
     return { status: 404 }
   })
+}
 
 const noop = () => Promise.resolve()
 
@@ -2712,6 +2728,9 @@ describe('e2e synthetic chain', () => {
     expect(named(result, 'signed and posted')?.ok).toBe(true)
     expect(named(result, 'ack')?.ok).toBe(true)
     expect(named(result, 'invite observed')?.ok).toBe(true)
+    // The grant is withdrawn THROUGH the worker, which is both the cleanup and the proof that a refund
+    // revokes. Everything after it is belt and braces.
+    expect(named(result, 'synthetic refund revoked')?.ok).toBe(true)
     expect(named(result, 'cleanup: invite cancelled')?.ok).toBe(true)
     // the synthetic grant record is also removed (no leftover pi_ in a production KV)
     expect(named(result, 'grant record deleted')?.ok).toBe(true)
@@ -2734,12 +2753,16 @@ describe('e2e synthetic chain', () => {
   })
 
   // Same header as the /health probe above, for the same reason: the wizard's own synthetic delivery
-  // must not be the thing a zone rule refuses, on a worker that is live and healthy.
-  it('the synthetic e2e POST sends a browser User-Agent (bot-UA filtering net)', async () => {
-    let whUA: unknown = null
+  // must not be the thing a zone rule refuses, on a worker that is live and healthy. BOTH deliveries,
+  // because they are the same probe: a refund that went out bare would be refused by the rule the
+  // payment slipped past, and the check would report that as a broken revoke path.
+  it('every synthetic e2e POST sends a browser User-Agent (bot-UA filtering net)', async () => {
+    const whUAs: unknown[] = []
+    let webhooks = 0
     const fetchImpl = async (url: string, init: any) => {
       if (url.includes('/wh/stripe/')) {
-        whUA = init?.headers?.['user-agent']
+        whUAs.push(init?.headers?.['user-agent'])
+        webhooks += 1
         return {
           status: 200,
           async json() {
@@ -2756,9 +2779,9 @@ describe('e2e synthetic chain', () => {
         }
       if (url.includes('/memberships/'))
         return {
-          status: 200,
+          status: webhooks > 1 ? 404 : 200,
           async json() {
-            return { state: 'pending' }
+            return webhooks > 1 ? null : { state: 'pending' }
           },
         }
       return {
@@ -2779,7 +2802,7 @@ describe('e2e synthetic chain', () => {
       sleep: noop,
     })
     expect(named(result, 'ack')?.ok).toBe(true)
-    expect(whUA).toBe(BROWSER_UA)
+    expect(whUAs).toEqual([BROWSER_UA, BROWSER_UA])
   })
 
   it('non-2xx ack -> ack fails, invite poll skipped, cleanup still runs', async () => {
@@ -2996,6 +3019,562 @@ describe('e2e synthetic chain', () => {
     expect(del?.ok).toBe(false)
     expect(del?.severity).toBe('warn')
     expect(del?.fix).toContain('kv delete boom')
+  })
+})
+
+// THE CHECK UNDOES ITS OWN GRANT THROUGH THE WORKER.
+//
+// The grant writes state in three places the worker owns - the invitation, the KV grant record, and the
+// transaction's guard with the buyer's ledger inside it - and only a refund the worker verifies touches
+// all three. Cancelling the invitation directly and deleting the record with a raw KV delete reached two
+// of them and left the third saying the synthetic purchase still entitles the team, which is what made a
+// deployer's own refund test correctly keep a team a phantom purchase entitled. The end-to-end proof
+// runs against the real worker in `wizard-synthetic-check.test.ts`; these are the wiring guards.
+describe('the synthetic check withdraws its grant through the worker', () => {
+  const ok = {
+    status: 200,
+    async json() {
+      return null
+    },
+  }
+  const gone = {
+    status: 404,
+    async json() {
+      return null
+    },
+  }
+  const pending = {
+    status: 200,
+    async json() {
+      return { state: 'pending' }
+    },
+  }
+  const empty = {
+    status: 200,
+    async json() {
+      return []
+    },
+  }
+
+  it('sends a FULL refund of the SAME transaction, signed like the payment', async () => {
+    const posted: Array<{ body: string; headers: Record<string, string> }> = []
+    let webhooks = 0
+    const fetchImpl = async (url: string, init: any) => {
+      if (url.includes('/wh/stripe/')) {
+        posted.push({ body: init.body, headers: init.headers })
+        webhooks += 1
+        return ok
+      }
+      if (url.includes('/invitations')) return empty
+      if (url.includes('/memberships/')) return webhooks > 1 ? gone : pending
+      return {
+        status: 204,
+        async json() {
+          return null
+        },
+      }
+    }
+    const result = await e2e({
+      config: E2E_CONFIG,
+      stripeSecret: 'whsec_x',
+      githubToken: 'ghp_x',
+      fetch: fetchImpl as never,
+      run: okRun,
+      transactionId: 'pi_e2e_1',
+      timestamp: 1700000000,
+      sleep: noop,
+    })
+    expect(result.ok).toBe(true)
+    expect(posted).toHaveLength(2)
+
+    // The refund the real adapter reads: the SAME payment_intent as the payment, fully refunded.
+    const refund = JSON.parse(posted[1].body)
+    expect(refund.type).toBe('charge.refunded')
+    expect(refund.data.object.payment_intent).toBe('pi_e2e_1')
+    expect(refund.data.object.amount_refunded).toBe(refund.data.object.amount)
+    // Signed exactly as the payment was - the worker verifies it the same way or not at all.
+    expect(posted[1].headers['stripe-signature']).toBe(
+      stripeSignatureHeader(posted[1].body, 'whsec_x', 1700000000),
+    )
+  })
+
+  it('the refund the pack builds is the one the real adapter revokes on', () => {
+    const normalized = stripe.parse({
+      bodyText: JSON.stringify(
+        buildE2eRefundEvent({
+          productId: 'prod_x',
+          username: 'octocat',
+          transactionId: 'pi_e2e_1',
+        }),
+      ),
+      headers: new Headers(),
+    })
+    expect(normalized?.event_type).toBe('refund')
+    expect(normalized?.transaction_id).toBe('pi_e2e_1')
+    expect(normalized?.is_full_refund).toBe(true)
+    expect(STRIPE_E2E_PACK.buildRefundEvent).toBe(buildE2eRefundEvent)
+  })
+
+  it('the withdrawal runs BEFORE the direct cleanup, which is what makes the direct calls belt and braces', async () => {
+    const order: string[] = []
+    let webhooks = 0
+    const fetchImpl = async (url: string, init: any) => {
+      const method = (init?.method ?? 'GET').toUpperCase()
+      if (url.includes('/wh/stripe/')) {
+        webhooks += 1
+        order.push(webhooks === 1 ? 'payment' : 'refund')
+        return ok
+      }
+      if (method === 'DELETE' && url.includes('/memberships/')) {
+        order.push('direct-cancel')
+        return gone
+      }
+      if (url.includes('/invitations')) return empty
+      if (url.includes('/memberships/')) return webhooks > 1 ? gone : pending
+      return {
+        status: 204,
+        async json() {
+          return null
+        },
+      }
+    }
+    await e2e({
+      config: E2E_CONFIG,
+      stripeSecret: 'whsec_x',
+      githubToken: 'ghp_x',
+      fetch: fetchImpl as never,
+      run: okRun,
+      transactionId: 'pi_e2e_1',
+      timestamp: 1700000000,
+      sleep: noop,
+    })
+    expect(order).toEqual(['payment', 'refund', 'direct-cancel'])
+  })
+
+  it('a worker that acks the payment and refuses the refund is RED, and says refunds would not revoke', async () => {
+    let webhooks = 0
+    const fetchImpl = async (url: string, init: any) => {
+      if (url.includes('/wh/stripe/')) {
+        webhooks += 1
+        return webhooks > 1
+          ? {
+              status: 400,
+              async json() {
+                return null
+              },
+            }
+          : ok
+      }
+      if (url.includes('/invitations')) return empty
+      if (url.includes('/memberships/')) return pending
+      return {
+        status: 204,
+        async json() {
+          return null
+        },
+      }
+    }
+    const result = await e2e({
+      config: E2E_CONFIG,
+      stripeSecret: 'whsec_x',
+      githubToken: 'ghp_x',
+      fetch: fetchImpl as never,
+      run: okRun,
+      transactionId: 'pi_e2e_1',
+      timestamp: 1700000000,
+      sleep: noop,
+    })
+    expect(result.ok).toBe(false)
+    const revoke = named(result, 'synthetic refund revoked')
+    expect(revoke?.ok).toBe(false)
+    expect(revoke?.severity).toBeUndefined()
+    expect(revoke?.fix).toContain('refunds would not revoke either')
+  })
+
+  it('a buyer still in the team after the refund is RED, and names what stays behind', async () => {
+    const result = await e2e({
+      config: E2E_CONFIG,
+      stripeSecret: 'whsec_x',
+      githubToken: 'ghp_x',
+      fetch: e2eFetch((method, url) => {
+        if (url.includes('/wh/stripe/')) return { status: 200 }
+        if (method === 'GET' && url.includes('/teams/pro/memberships/octocat'))
+          return { status: 200, json: { state: 'pending' } }
+        if (method === 'GET' && url.includes('/invitations'))
+          return { status: 200, json: [] }
+        if (method === 'DELETE') return { status: 204 }
+        return { status: 404 }
+      }),
+      run: okRun,
+      transactionId: 'pi_e2e_1',
+      timestamp: 1700000000,
+      pollAttempts: 2,
+      sleep: noop,
+    })
+    expect(result.ok).toBe(false)
+    const revoke = named(result, 'synthetic refund revoked')
+    expect(revoke?.ok).toBe(false)
+    expect(revoke?.fix).toContain('still in pro')
+    expect(revoke?.fix).toContain('stays on the books')
+  })
+
+  it('log_only: the refund is SKIPPED with a warning that names what stays behind, and never gates', async () => {
+    const fetchImpl = greenE2eFetch()
+    const result = await e2e({
+      config: {
+        ...E2E_CONFIG,
+        productTeamMap: {
+          defaults: { teams: [] },
+          stripe: {
+            prod_x: { teams: ['pro'], revoke_policy: { mode: 'log_only' } },
+          },
+        },
+      },
+      stripeSecret: 'whsec_x',
+      githubToken: 'ghp_x',
+      fetch: fetchImpl,
+      run: okRun,
+      transactionId: 'pi_e2e_1',
+      timestamp: 1700000000,
+      sleep: noop,
+    })
+    // A product told not to lose access on a refund has nothing here to prove, so the run stays green.
+    expect(result.ok).toBe(true)
+    const revoke = named(result, 'synthetic refund revoked')
+    expect(revoke?.ok).toBe(false)
+    expect(revoke?.severity).toBe('warn')
+    expect(revoke?.fix).toContain('not auto_revoke')
+    expect(revoke?.fix).toContain('stays on the books')
+    // Only the payment went out - nothing was sent whose answer could not be judged.
+    const posts = (fetchImpl as any).calls.filter(
+      (c: { method: string; url: string }) =>
+        c.method === 'POST' && c.url.includes('/wh/stripe/'),
+    )
+    expect(posts).toHaveLength(1)
+  })
+
+  it('a product with NO revoke_policy is treated as log_only, exactly as the worker treats it', () => {
+    expect(e2eRevokesOnRefund(E2E_CONFIG, 'stripe', 'prod_x')).toBe(true)
+    expect(
+      e2eRevokesOnRefund(
+        {
+          productTeamMap: {
+            defaults: { teams: [] },
+            stripe: { p: { teams: ['t'] } },
+          },
+        },
+        'stripe',
+        'p',
+      ),
+    ).toBe(false)
+    // An unmapped product falls back to the whole `defaults` object, policy included.
+    expect(
+      e2eRevokesOnRefund(
+        {
+          productTeamMap: {
+            defaults: { teams: ['t'], revoke_policy: { mode: 'auto_revoke' } },
+          },
+        },
+        'stripe',
+        'unmapped',
+      ),
+    ).toBe(true)
+  })
+
+  it('a pack with no refund shape SKIPS with a warning and never throws', async () => {
+    const result = await e2e({
+      config: {
+        githubOrg: 'acme',
+        productTeamMap: {
+          defaults: { teams: [] },
+          acmepay: {
+            sku_x: { teams: ['pro'], revoke_policy: { mode: 'auto_revoke' } },
+          },
+        },
+        e2e: { testUsername: 'octocat', url: 'https://worker.example' },
+      },
+      pack: ACME_PACK,
+      secret: 'acme_secret',
+      githubToken: 'ghp_x',
+      fetch: greenAcmeFetch(),
+      run: okRun,
+      transactionId: 'tx_1',
+      timestamp: 1700000000,
+      sleep: noop,
+    })
+    expect(result.ok).toBe(true)
+    const revoke = named(result, 'synthetic refund revoked')
+    expect(revoke?.severity).toBe('warn')
+    expect(revoke?.fix).toContain('describes no refund event')
+    expect(revoke?.fix).toContain('buildRefundEvent')
+  })
+
+  it('a pack whose buildRefundEvent is not callable is refused up front', () => {
+    expect(
+      resolveE2ePack({
+        webhookPath: 'a',
+        secretName: 'B',
+        buildEvent: () => ({}),
+        signatureHeader: () => ({ name: 'x', value: 'y' }),
+        buildRefundEvent: 'nope',
+      } as never).error,
+    ).toContain('buildRefundEvent')
+  })
+
+  it('the refund is signed with a FRESH timestamp, not the one the payment used', async () => {
+    // A provider that carries a timestamp in its signature rejects one outside its replay window, and by
+    // the time the refund goes out the payment's is as old as the invite poll took - unbounded for a
+    // caller that widened the poll. Re-using it would earn a 401 the check reports as "the worker refused
+    // the refund", which is a wrong diagnosis of a right worker. So the clock is driven here: the invite
+    // takes three polls to appear and each wait advances it, putting the payment's timestamp 400s in the
+    // past by the time the refund goes out - past Stripe's own 300s tolerance.
+    const startMs = 1_700_000_000_000
+    let nowMs = startMs
+    const realNow = Date.now
+    Date.now = () => nowMs
+    try {
+      const stamps: number[] = []
+      let webhooks = 0
+      let polls = 0
+      const fetchImpl = async (url: string, init: any) => {
+        if (url.includes('/wh/stripe/')) {
+          stamps.push(
+            Number(
+              /^t=(\d+),/.exec(init.headers['stripe-signature'] as string)![1],
+            ),
+          )
+          webhooks += 1
+          return {
+            status: 200,
+            async json() {
+              return null
+            },
+          }
+        }
+        if (url.includes('/invitations'))
+          return {
+            status: 200,
+            async json() {
+              return []
+            },
+          }
+        if (url.includes('/memberships/')) {
+          if (webhooks > 1)
+            return {
+              status: 404,
+              async json() {
+                return null
+              },
+            }
+          polls += 1
+          return polls >= 3
+            ? {
+                status: 200,
+                async json() {
+                  return { state: 'pending' }
+                },
+              }
+            : {
+                status: 404,
+                async json() {
+                  return null
+                },
+              }
+        }
+        return {
+          status: 204,
+          async json() {
+            return null
+          },
+        }
+      }
+      // No `timestamp` option, so each delivery is signed against the clock as it stands.
+      const result = await e2e({
+        config: E2E_CONFIG,
+        stripeSecret: 'whsec_x',
+        githubToken: 'ghp_x',
+        fetch: fetchImpl as never,
+        run: okRun,
+        transactionId: 'pi_e2e_1',
+        pollIntervalMs: 200_000,
+        sleep: async (ms: number) => {
+          nowMs += ms
+        },
+      })
+      expect(result.ok).toBe(true)
+      expect(stamps).toHaveLength(2)
+      expect(stamps[0]).toBe(Math.floor(startMs / 1000))
+      expect(stamps[1] - stamps[0]).toBe(400)
+    } finally {
+      Date.now = realNow
+    }
+  })
+
+  it('a caller that PINS a timestamp still gets that one on both deliveries', async () => {
+    // A pinned clock is what makes a signature assertion reproducible, so the fresh-timestamp rule must
+    // not take that away.
+    const stamps: string[] = []
+    let webhooks = 0
+    const fetchImpl = async (url: string, init: any) => {
+      if (url.includes('/wh/stripe/')) {
+        stamps.push(init.headers['stripe-signature'] as string)
+        webhooks += 1
+        return {
+          status: 200,
+          async json() {
+            return null
+          },
+        }
+      }
+      if (url.includes('/invitations'))
+        return {
+          status: 200,
+          async json() {
+            return []
+          },
+        }
+      if (url.includes('/memberships/'))
+        return {
+          status: webhooks > 1 ? 404 : 200,
+          async json() {
+            return webhooks > 1 ? null : { state: 'pending' }
+          },
+        }
+      return {
+        status: 204,
+        async json() {
+          return null
+        },
+      }
+    }
+    await e2e({
+      config: E2E_CONFIG,
+      stripeSecret: 'whsec_x',
+      githubToken: 'ghp_x',
+      fetch: fetchImpl as never,
+      run: okRun,
+      transactionId: 'pi_e2e_1',
+      timestamp: 1700000000,
+      sleep: noop,
+    })
+    expect(stamps.every((v) => v.startsWith('t=1700000000,'))).toBe(true)
+  })
+
+  it('a GitHub outage during the removal poll never takes the cleanup down with it', async () => {
+    // The withdrawal runs inside the cleanup's `finally`, BEFORE the direct invite cancel. A throw
+    // escaping it would take the cleanup with it and leave exactly the dangling invite that `finally`
+    // exists to prevent - so the run must still finish, still cancel, and say the revoke is unconfirmed.
+    let webhooks = 0
+    let cancelled = false
+    const fetchImpl = async (url: string, init: any) => {
+      const method = (init?.method ?? 'GET').toUpperCase()
+      if (url.includes('/wh/stripe/')) {
+        webhooks += 1
+        return {
+          status: 200,
+          async json() {
+            return null
+          },
+        }
+      }
+      if (method === 'DELETE' && url.includes('/memberships/')) {
+        cancelled = true
+        return {
+          status: 404,
+          async json() {
+            return null
+          },
+        }
+      }
+      if (url.includes('/invitations'))
+        return {
+          status: 200,
+          async json() {
+            return []
+          },
+        }
+      if (url.includes('/memberships/')) {
+        if (webhooks > 1) throw new Error('github unreachable')
+        return {
+          status: 200,
+          async json() {
+            return { state: 'pending' }
+          },
+        }
+      }
+      return {
+        status: 204,
+        async json() {
+          return null
+        },
+      }
+    }
+    const result = await e2e({
+      config: E2E_CONFIG,
+      stripeSecret: 'whsec_x',
+      githubToken: 'ghp_x',
+      fetch: fetchImpl as never,
+      run: okRun,
+      transactionId: 'pi_e2e_1',
+      timestamp: 1700000000,
+      sleep: noop,
+    })
+    expect(result.step).toBe('e2e')
+    expect(cancelled).toBe(true)
+    expect(named(result, 'cleanup: invite cancelled')?.ok).toBe(true)
+    expect(named(result, 'synthetic refund revoked')?.fix).toContain(
+      'unconfirmed rather than failed',
+    )
+  })
+
+  it('an unreachable GitHub at the direct cancel still returns a check list, not an exception', async () => {
+    // The last thing the `finally` does is the direct cancel, and `ghRequest` awaits `doFetch` bare - so a
+    // network error there used to escape the step entirely and end the run with an exception instead of a
+    // report, on a check whose whole job is to report. It now reads as "not cleaned", with the link.
+    let webhooks = 0
+    const fetchImpl = async (url: string, init: any) => {
+      const method = (init?.method ?? 'GET').toUpperCase()
+      if (url.includes('/wh/stripe/')) {
+        webhooks += 1
+        return {
+          status: 200,
+          async json() {
+            return null
+          },
+        }
+      }
+      if (method === 'DELETE') throw new Error('github unreachable')
+      if (url.includes('/invitations')) throw new Error('github unreachable')
+      if (url.includes('/memberships/'))
+        return {
+          status: webhooks > 1 ? 404 : 200,
+          async json() {
+            return webhooks > 1 ? null : { state: 'pending' }
+          },
+        }
+      return {
+        status: 204,
+        async json() {
+          return null
+        },
+      }
+    }
+    const result = await e2e({
+      config: E2E_CONFIG,
+      stripeSecret: 'whsec_x',
+      githubToken: 'ghp_x',
+      fetch: fetchImpl as never,
+      run: okRun,
+      transactionId: 'pi_e2e_1',
+      timestamp: 1700000000,
+      sleep: noop,
+    })
+    expect(result.step).toBe('e2e')
+    const cancel = named(result, 'cleanup: invite cancelled')
+    expect(cancel?.ok).toBe(false)
+    expect(cancel?.fix).toContain('people/pending_invitations')
+    // The withdrawal through the worker still happened and is still reported.
+    expect(named(result, 'synthetic refund revoked')?.ok).toBe(true)
   })
 })
 

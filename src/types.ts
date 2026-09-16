@@ -287,8 +287,10 @@ export interface PaymentAdapter {
    * `Response` IS the ack (the router returns it, no enqueue), `null` falls through to the normal
    * `parse → enqueue` path. It exists for providers whose webhook carries handshake steps as well as
    * terminal events - e.g. an interactive pre-charge query the adapter must answer (its own bounded
-   * outbound call) before the terminal payment event arrives and flows through `parse`. Every existing
-   * adapter omits it and is unaffected.
+   * outbound call) before the terminal payment event arrives and flows through `parse`, or a verified
+   * event the adapter recognises whose correct outcome is "nothing to grant" and must be acknowledged
+   * 200 rather than 400 (the Stripe adapter does this for a Checkout Session whose payment has not
+   * settled). An adapter that omits it is unaffected.
    */
   handle?(raw: RawRequest, env: CloudflareBindings): Promise<Response | null>
 }

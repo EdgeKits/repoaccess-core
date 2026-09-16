@@ -156,16 +156,7 @@ export function makeStep(): { step: WorkflowStep; sleeps: number[] } {
     // pass a retry config as the middle arg.
     do: async (name: string, a: unknown, b?: unknown) => {
       const fn = (typeof b === 'function' ? b : a) as () => unknown
-      const value = await fn()
-      if (value !== null && typeof value === 'object') {
-        const message =
-          `step.do("${name}") resolved to an object. A step callback must return a string, a ` +
-          `primitive, or nothing: an object makes the Workflows runtime record the invocation as ` +
-          `an exception. Stringify the value inside the callback and parse it after the await.`
-        stepResultViolations.push(message)
-        throw new Error(message)
-      }
-      return value
+      return assertStepResult(name, await fn())
     },
     sleep: (_name: string, ms: number) => {
       sleeps.push(ms)
@@ -174,4 +165,62 @@ export function makeStep(): { step: WorkflowStep; sleeps: number[] } {
     sleepUntil: () => Promise.resolve(),
   }
   return { step: step as unknown as WorkflowStep, sleeps }
+}
+
+function assertStepResult(name: string, value: unknown): unknown {
+  if (value !== null && typeof value === 'object') {
+    const message =
+      `step.do("${name}") resolved to an object. A step callback must return a string, a ` +
+      `primitive, or nothing: an object makes the Workflows runtime record the invocation as ` +
+      `an exception. Stringify the value inside the callback and parse it after the await.`
+    stepResultViolations.push(message)
+    throw new Error(message)
+  }
+  return value
+}
+
+/**
+ * A fake step that MEMOIZES, the way the production engine does: a step name that already completed
+ * returns its stored value on a later run of the same instance and never re-runs its callback.
+ * `makeStep` re-runs every callback, which is exactly what hides a check whose answer the engine
+ * would replay stale.
+ *
+ * `haltAfter` models the instance being suspended mid-run (a deploy, an eviction, a pause): once a
+ * step whose name starts with that prefix completes, every LATER step throws without running or
+ * recording anything, so the run ends there. Calling `resume()` clears the halt; running the same
+ * workflow again with the same `step` then replays everything that completed and executes the rest.
+ */
+export function makeMemoStep(haltAfter?: string): {
+  step: WorkflowStep
+  names: string[]
+  resume: () => void
+} {
+  const memo = new Map<string, unknown>()
+  const names: string[] = []
+  let halted = false
+  let armed = haltAfter
+  const step = {
+    do: async (name: string, a: unknown, b?: unknown) => {
+      if (memo.has(name)) return memo.get(name)
+      if (halted) throw new Error(`instance suspended before step "${name}"`)
+      const fn = (typeof b === 'function' ? b : a) as () => unknown
+      const value = assertStepResult(name, await fn())
+      memo.set(name, value)
+      names.push(name)
+      if (armed && name.startsWith(armed)) {
+        halted = true
+        armed = undefined
+      }
+      return value
+    },
+    sleep: () => Promise.resolve(),
+    sleepUntil: () => Promise.resolve(),
+  }
+  return {
+    step: step as unknown as WorkflowStep,
+    names,
+    resume: () => {
+      halted = false
+    },
+  }
 }

@@ -214,6 +214,16 @@ export interface E2ePack {
     username: string
     transactionId: string
   }): unknown
+  /**
+   * OPTIONAL. The same provider's FULL REFUND of that same transaction - what lets the check undo its
+   * own grant THROUGH the worker instead of around it. Omit it and the synthetic refund is skipped with
+   * a visible warning naming what is left behind; nothing throws.
+   */
+  buildRefundEvent?(args: {
+    productId: string
+    username: string
+    transactionId: string
+  }): unknown
   /** Both halves are provider-specific: the header NAME as much as the signing scheme. */
   signatureHeader(
     body: string,
@@ -313,6 +323,12 @@ export function buildE2eEvent(args: {
   username: string
   transactionId: string
 }): any
+/** The full refund of that same transaction - the event the check sends to undo its own grant. */
+export function buildE2eRefundEvent(args: {
+  productId: string
+  username: string
+  transactionId: string
+}): any
 export function stripeSignatureHeader(
   body: string,
   secret: string,
@@ -329,6 +345,15 @@ export function resolveE2eProduct(
   config: any,
   adapter?: string,
 ): E2eProduct | null
+/**
+ * Whether a refund of this product WITHDRAWS the grant under the deployed config. Mirrors the worker's
+ * own resolution, including its `log_only` default for a product that names no policy.
+ */
+export function e2eRevokesOnRefund(
+  config: any,
+  adapter: string,
+  productId: string,
+): boolean
 export function kvTitle(
   workerName: string,
   env: string | null,

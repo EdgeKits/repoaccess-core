@@ -9,8 +9,12 @@ import {
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { createWorker } from '../src/create-worker'
 import { resolveByTxn, completeClaim } from '../src/claim/claim'
+import {
+  defaultClaimTemplate,
+  type ClaimView,
+} from '../src/claim/claim-template'
 import { isValidGithubUsername } from '../src/username'
-import type { PaymentAdapter, RepoAccessConfig } from '../src/types'
+import type { Branding, PaymentAdapter, RepoAccessConfig } from '../src/types'
 
 // BASELINE - claim lifecycle (GET form/JSON-no-PII, POST enqueue, single-flight 409, dedup,
 // corrected-handle re-run). Retain/retry-on-user-not-found + TTL-from-creation live in
@@ -1260,5 +1264,43 @@ describe('completeClaim (engine primitive)', () => {
     expect(calls[0][0][0].id).toBe('stub-claim_completed-txn_1-octocta')
     expect(calls[1][0][0].id).toBe('stub-claim_completed-txn_1-octocat')
     expect(calls[1][0][0].id).not.toBe(calls[0][0][0].id)
+  })
+})
+
+// GitHub mails the invitation to the primary address on the buyer's GITHUB account, which is not
+// necessarily the address they paid with. For that buyer the in-app notification is the path that
+// actually works, so every page that sends them looking for the invitation has to name BOTH channels.
+// The claim page did; the delivery page said "check your email" alone, while the setup guide documented
+// both pages as naming both. Pinned here, per view, because a sentence in a doc cannot hold two
+// components in step - that is exactly how the two drifted apart in the first place.
+describe('the pages that send a buyer looking for the invitation name both channels', () => {
+  const brand: Branding = {
+    name: 'Fixture Seller',
+    logoUrl: '',
+    faviconUrl: '',
+  }
+
+  const cases: { what: string; view: ClaimView }[] = [
+    {
+      what: 'the claim page',
+      view: { kind: 'submitted', token: 'tok', username: 'octocat' },
+    },
+    { what: 'the delivery page', view: { kind: 'granted' } },
+  ]
+
+  for (const { what, view } of cases)
+    it(`${what} (${view.kind}) names email AND GitHub notifications`, async () => {
+      const html = (await defaultClaimTemplate({ brand, view })).toString()
+      expect(html).toContain('email')
+      expect(html).toContain('notifications')
+    })
+
+  it('the delivery page says it in one sentence naming both', async () => {
+    const html = (
+      await defaultClaimTemplate({ brand, view: { kind: 'granted' } })
+    ).toString()
+    expect(html).toContain(
+      'Check your email and your GitHub notifications for the invitation, and accept it.',
+    )
   })
 })

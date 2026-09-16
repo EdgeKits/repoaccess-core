@@ -197,8 +197,13 @@ needs it. Open `/health` and confirm `{"status":"ok"}`.
    `checkout.session.completed` webhook omits line items, so the worker reads the product from metadata.
 4. **Create the webhook destination** (Developers, then Webhooks (Event destinations), then Add
    destination). The current flow takes the **events first**, then the destination URL:
-   - **Events (select these three):** `checkout.session.completed`, `charge.refunded`,
-     `charge.dispute.created`.
+   - **Events (select these four):** `checkout.session.completed`,
+     `checkout.session.async_payment_succeeded`, `charge.refunded`, `charge.dispute.created`. The
+     fourth is for delayed payment methods such as bank debits and vouchers: Stripe completes the
+     checkout before that money arrives, and `checkout.session.async_payment_succeeded` is the event
+     that grants those buyers once it does. If your webhook endpoint already exists with only the other
+     three, add `checkout.session.async_payment_succeeded` to it in the Stripe dashboard, or buyers who
+     pay with a delayed method are never granted.
    - **Payload style:** pick **Snapshot** if the option appears; the current flow may not show it (it
      defaults to the full snapshot payload).
    - **Endpoint URL:** `https://<your-worker>.workers.dev/wh/stripe/<SECRET_PATH>`, where `<SECRET_PATH>`
@@ -351,8 +356,9 @@ prove a setup is a decision you make deliberately, not one a script walks you in
 Stripe keeps test and live data apart, so nothing you built in test mode exists in live mode. **The
 steps are the ones you already did**, and you already know how to do them - only now in the live
 dashboard: create the product, create the Payment Link (with the same GitHub-handle field and the same
-redirect), and add the webhook endpoint (same worker URL, same three events -
-`checkout.session.completed`, `charge.refunded`, `charge.dispute.created`).
+redirect), and add the webhook endpoint (same worker URL, same four events -
+`checkout.session.completed`, `checkout.session.async_payment_succeeded`, `charge.refunded`,
+`charge.dispute.created`).
 
 The labels are not necessarily the ones section 4 names, because those are the Test-mode ones. The three
 actions are the same three, in the same order.

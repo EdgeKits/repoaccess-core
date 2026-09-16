@@ -23,6 +23,7 @@ import {
   assertProductTeamMap,
   makeConfigGate,
   resolveProductConfig,
+  revokeGate,
 } from '../config/config'
 import { sha256Hex } from './workflow-id'
 import { verifyApiCallback } from '../security/verify'
@@ -52,7 +53,16 @@ import {
   failKey,
   claimSubmittedKey,
 } from '../kv-keys'
-import { claimGuard } from '../claim/claim-guard'
+import {
+  buyerLedger,
+  claimGuard,
+  copyExpiresAt,
+  ledgerKey,
+  type CommitResult,
+  type GrantCopy,
+  type GuardSnapshot,
+  type RefundFacts,
+} from '../claim/claim-guard'
 
 const KV_MIN_TTL_SEC = 60 // Cloudflare KV floor for expirationTtl
 
@@ -297,11 +307,13 @@ async function runGrant(
   adapter: string,
   event: NormalizedEvent,
   config: ProductConfig,
+  map: ProductTeamMap,
   sink: EventSink,
   fromClaim: boolean,
 ): Promise<void> {
   const teams = config.teams ?? []
   const username = event.github_username
+  const policy = config.revoke_policy ?? { mode: 'log_only' }
 
   // A refund or dispute may already have revoked this transaction, and the two orderings that get
   // here are both real: the refund arrived BEFORE the payment_success behind it (provider events carry
@@ -309,7 +321,21 @@ async function runGrant(
   // grant record did not exist yet. Either way the purchase is dead - so grant nothing AND mint no
   // claim, because a fresh token here would be a 30-day bearer credential for a refunded transaction.
   // Checked before every write, the redirect alias included, so a revoked txn leaves no new artifact.
-  if (await guardRevoked(step, env, adapter, event.transaction_id)) {
+  // The policy applied is THIS grant's product's: a refund that found nothing to revoke recorded only
+  // what it was, because it could not know what was sold.
+  const atEntry = refundVerdict(
+    await guardSnapshot(step, env, 'claim-guard-entry', adapter, event),
+    policy,
+  )
+  if (atEntry.revoked) {
+    const sequence = await guardPromote(
+      step,
+      env,
+      'claim-guard-revoke-entry',
+      adapter,
+      event,
+      atEntry,
+    )
     log('info', 'grant refused: transaction already revoked', {
       adapter,
       transaction_id: event.transaction_id,
@@ -326,6 +352,7 @@ async function runGrant(
       username,
       'transaction_revoked',
       'refund/dispute preceded this grant',
+      { trigger: atEntry.trigger, sequence },
     )
     await clearSubmittedMarker(step, env, adapter, event.transaction_id)
     return
@@ -387,7 +414,26 @@ async function runGrant(
     return
   }
 
+  // REGISTER BEFORE THE FIRST WRITE. The buyer's ledger learns that this transaction entitles these
+  // teams before GitHub is touched, so a refund of ANOTHER purchase by the same buyer that runs while
+  // this grant is still in flight keeps a team this grant is about to write, instead of removing it
+  // underneath. A grant that ends without committing settles the entry (`settleUncommittedGrant`); a
+  // revoke removes it in the same call that asks what the rest still entitle.
+  await step.do(
+    `buyer-ledger-register:${adapter}:${event.transaction_id}`,
+    async () => {
+      await buyerLedger(env, username).registerGrant(
+        ledgerKey(adapter, event.transaction_id),
+        teams,
+      )
+      return true
+    },
+  )
+
   const grantedTeams: string[] = []
+  // The teams this grant ADDED, as opposed to found already present. Only these can become a debt when
+  // this grant is revoked while another purchase keeps them (see `withdrawGrant`).
+  const writtenTeams: string[] = []
   for (const slug of teams) {
     // Reconcile: 200 = already active OR pending → converged, skip. 404 = not a member → invite.
     const current = await ghStep(
@@ -416,6 +462,16 @@ async function runGrant(
         `team-get ${slug} → ${current.status}`,
         false,
         fromClaim,
+      )
+      await settleUncommittedGrant(
+        step,
+        env,
+        org,
+        origin,
+        adapter,
+        event,
+        map,
+        sink,
       )
       return
     }
@@ -447,6 +503,16 @@ async function runGrant(
           'username not found, falling back to claim',
           `We could not find the GitHub user "${username}". Check it and re-enter.`,
         )
+        await settleUncommittedGrant(
+          step,
+          env,
+          org,
+          origin,
+          adapter,
+          event,
+          map,
+          sink,
+        )
         return
       }
       // Otherwise terminal: a claim-originated 404 RETAINS the token for a corrected resubmit
@@ -467,9 +533,20 @@ async function runGrant(
         userNotFound,
         fromClaim,
       )
+      await settleUncommittedGrant(
+        step,
+        env,
+        org,
+        origin,
+        adapter,
+        event,
+        map,
+        sink,
+      )
       return
     }
     grantedTeams.push(slug)
+    writtenTeams.push(slug)
   }
 
   const record: GrantRecord = {
@@ -492,18 +569,74 @@ async function runGrant(
       JSON.stringify(record),
       { expirationTtl: GRANT_TTL_SEC },
     )
+    await buyerLedger(env, username).recordWritten(
+      ledgerKey(adapter, event.transaction_id),
+      writtenTeams,
+    )
     return true
   })
+
+  // COMMIT, ATOMICALLY, AFTER THE LAST WRITE. The entry check above is a memoized step: after a GitHub
+  // backoff sleep or a suspension the engine replays its old answer, so a refund that landed since is
+  // invisible to it. So the grant settles with the guard in a NEW step, in one call that either finds
+  // the transaction revoked (or a recorded refund that revokes this product) and refuses, or marks it
+  // `granted` with a copy of the record. There is no gap between the check and the commit for a refund
+  // to fall into, and once committed, a refund asks the guard before KV, so a grant record that some
+  // KV location cannot see yet is still found. A refused commit withdraws what this instance just did
+  // and never announces the grant.
+  const committedJson = await step.do(
+    `claim-guard-commit:${adapter}:${event.transaction_id}`,
+    async () =>
+      JSON.stringify(
+        await claimGuard(env, adapter, event.transaction_id).commitGrant(
+          record,
+          policy,
+        ),
+      ),
+  )
+  const commit = JSON.parse(committedJson) as CommitResult
+  if (!commit.committed) {
+    const afterWrite = refundVerdict(commit.snapshot, policy)
+    log(
+      'warn',
+      'grant withdrawn: transaction revoked while the grant was in flight',
+      {
+        adapter,
+        transaction_id: event.transaction_id,
+        from_claim: fromClaim,
+        origin,
+      },
+    )
+    await withdrawAccess(
+      step,
+      env,
+      org,
+      origin,
+      adapter,
+      event,
+      map,
+      sink,
+      username,
+      grantedTeams,
+      afterWrite.revoked ? afterWrite.trigger : undefined,
+      asSequence(commit.snapshot.sequence),
+    )
+    if (fromClaim)
+      await clearSubmittedMarker(step, env, adapter, event.transaction_id)
+    return
+  }
 
   await emitEvent(step, org, origin, sink, 'access.granted', event, {
     github_username: username,
     teams: grantedTeams,
     status: 'success',
+    sequence: commit.sequence,
   })
 
   // A grant that originated from a completed claim also closes the claim: emit claim.completed and
   // consume the single-use token (+ reverse index) here in the workflow's terminal step - NOT at the
-  // route, so a failed attempt can retain the token for a corrected retry.
+  // route, so a failed attempt can retain the token for a corrected retry. The commit above already
+  // locked the claim: `granted` refuses every further submit.
   if (fromClaim) {
     await emitEvent(step, org, origin, sink, 'claim.completed', event, {
       github_username: username,
@@ -511,7 +644,6 @@ async function runGrant(
       status: 'success',
     })
     await consumeClaim(step, env, adapter, event.transaction_id)
-    await guardFinalize(step, env, adapter, event.transaction_id)
   }
 }
 
@@ -590,7 +722,11 @@ async function fail(
   username: string | null,
   reason: AccessFailedReason,
   detail?: string,
+  // For a `transaction_revoked` refusal only: the refund or dispute behind it when the guard recorded
+  // one, and the sequence of the transition into `revoked`. Each is omitted when unknown, never guessed.
+  revocation: { trigger?: RefundFacts['event_type']; sequence?: number } = {},
 ): Promise<void> {
+  const { trigger, sequence } = revocation
   // The wire envelope carries ONLY the coarse code; the raw detail stays in the log.
   log('error', 'grant failed', {
     transaction_id: event.transaction_id,
@@ -604,6 +740,8 @@ async function fail(
     teams,
     status: 'failure',
     reason,
+    ...(trigger ? { trigger } : {}),
+    ...(sequence !== undefined ? { sequence } : {}),
   })
 }
 
@@ -676,7 +814,8 @@ async function guardRelease(
   })
 }
 
-/** Lock the claim terminally (granted/closed) so no further attempt can acquire. */
+/** Lock a claim that failed for good (`closed`) so no further attempt can acquire. A successful
+ * grant never comes here: its commit is what locks the claim. */
 async function guardFinalize(
   step: WorkflowStep,
   env: CloudflareBindings,
@@ -692,31 +831,127 @@ async function guardFinalize(
 /**
  * Mark the transaction revoked so its claim token can never be redeemed. Strongly consistent and
  * keyed by `{adapter}:{transaction_id}`, so it beats both races the KV delete alone cannot: a submit
- * already in flight, and the propagation window on the deleted `claim:{token}`.
+ * already in flight, and the propagation window on the deleted `claim:{token}`. The refund's facts
+ * travel with the verdict, so a grant that later finds it can say what withdrew the purchase.
+ * Resolves to the sequence of the transition into `revoked`.
  */
 async function guardRevoke(
   step: WorkflowStep,
   env: CloudflareBindings,
   adapter: string,
-  txn: string,
-): Promise<void> {
-  await step.do(`claim-guard-revoke:${adapter}:${txn}`, async () => {
-    await claimGuard(env, adapter, txn).revoke()
-    return true
-  })
+  event: NormalizedEvent,
+): Promise<number | undefined> {
+  const txn = event.transaction_id
+  return asSequence(
+    await step.do(`claim-guard-revoke:${adapter}:${txn}`, () =>
+      claimGuard(env, adapter, txn).revoke(refundFacts(event)),
+    ),
+  )
 }
 
-/** Has a refund/dispute already revoked this transaction? Read before any grant work. */
-async function guardRevoked(
+/**
+ * A sequence read back from a step. An instance that completed the step under a release whose guard
+ * returned no number replays that old value (`true`), and an event must then carry no sequence rather
+ * than a wrong one.
+ */
+function asSequence(value: unknown): number | undefined {
+  return typeof value === 'number' && value > 0 ? value : undefined
+}
+
+/** The facts a refund or dispute event states - never what a policy makes of them. */
+function refundFacts(event: NormalizedEvent): RefundFacts {
+  return {
+    event_type: event.event_type === 'chargeback' ? 'chargeback' : 'refund',
+    is_full_refund: event.is_full_refund,
+  }
+}
+
+/**
+ * Read the guard's whole state inside a step. `label` must be unique within the instance, and every
+ * read passes its own: a step is memoized, so a second read under an old label replays the first
+ * read's answer instead of asking the guard again. The snapshot crosses the step boundary as a JSON
+ * string for the same reason as `ghStep`.
+ */
+async function guardSnapshot(
   step: WorkflowStep,
   env: CloudflareBindings,
+  label: string,
   adapter: string,
-  txn: string,
-): Promise<boolean> {
-  return (
-    (await step.do(`claim-guard-status:${adapter}:${txn}`, () =>
-      claimGuard(env, adapter, txn).status(),
-    )) === 'revoked'
+  event: NormalizedEvent,
+): Promise<GuardSnapshot> {
+  const txn = event.transaction_id
+  const json = await step.do(`${label}:${adapter}:${txn}`, async () =>
+    JSON.stringify(await claimGuard(env, adapter, txn).snapshot()),
+  )
+  return JSON.parse(json) as GuardSnapshot
+}
+
+type RefundVerdict =
+  | { revoked: false }
+  | {
+      revoked: true
+      alreadyMarked: boolean
+      facts?: RefundFacts
+      trigger?: RefundFacts['event_type']
+      // The guard's sequence for its `revoked` status, set only when the guard had already reached it.
+      sequence?: number
+    }
+
+/**
+ * What the guard means for a grant of THIS product. A `revoked` status is a verdict someone already
+ * reached and stands whatever the policy. Recorded refunds with no verdict are facts, and the grant
+ * judges them with its own product's policy through the same `revokeGate` the revoke path uses - which
+ * is what keeps a log_only product, or a partial refund under `full_refund_only`, granting exactly as
+ * it did before any refund was recorded.
+ */
+function refundVerdict(
+  snapshot: GuardSnapshot,
+  policy: RevokePolicy,
+): RefundVerdict {
+  const deciding = snapshot.refunds.find(
+    (facts) => revokeGate(policy, facts) === 'revoke',
+  )
+  if (snapshot.status === 'revoked') {
+    const facts = deciding ?? snapshot.refunds.at(-1)
+    return {
+      revoked: true,
+      alreadyMarked: true,
+      facts,
+      trigger: facts?.event_type,
+      sequence: snapshot.sequence,
+    }
+  }
+  if (deciding)
+    return {
+      revoked: true,
+      alreadyMarked: false,
+      facts: deciding,
+      trigger: deciding.event_type,
+    }
+  return { revoked: false }
+}
+
+/**
+ * Turn a verdict the grant reached from recorded facts into the guard's own `revoked` status, so the
+ * claim route and every later reader see it without re-judging. Resolves to the sequence of the
+ * transition into `revoked`: the one already minted when the guard had said so, the new one otherwise.
+ */
+async function guardPromote(
+  step: WorkflowStep,
+  env: CloudflareBindings,
+  label: string,
+  adapter: string,
+  event: NormalizedEvent,
+  verdict: RefundVerdict,
+): Promise<number | undefined> {
+  if (!verdict.revoked) return undefined
+  if (verdict.alreadyMarked) return asSequence(verdict.sequence)
+  const txn = event.transaction_id
+  const facts = verdict.facts
+  return asSequence(
+    await step.do(`${label}:${adapter}:${txn}`, () =>
+      claimGuard(env, adapter, txn).revoke(facts),
+    ),
   )
 }
 
@@ -814,28 +1049,6 @@ async function recordClaimError(
 // --- revoke -----------------------------------------------------------------
 
 /**
- * What the seller's policy says this refund/dispute event should do. Shared by BOTH revoke paths - a
- * granted purchase and a still-pending claim - so the two can never drift on what a refund means. The
- * caller logs its own reason; this decides.
- */
-type RevokeGate = 'revoke' | 'log_only' | 'partial_refund'
-
-function revokeGate(policy: RevokePolicy, event: NormalizedEvent): RevokeGate {
-  if (policy.mode !== 'auto_revoke') return 'log_only'
-  // A partial refund skips ONLY under `full_refund_only` - plain `auto_revoke` revokes it like any
-  // other refund. A chargeback carries `is_full_refund: null` and always revokes, whatever the flag
-  // says. And a refund that is partial NOW may be completed later: that arrives as its own instance
-  // (the id carries the scope, see workflow-id.ts), so this gate is asked again with the new answer.
-  if (
-    event.event_type === 'refund' &&
-    policy.full_refund_only &&
-    event.is_full_refund !== true
-  )
-    return 'partial_refund'
-  return 'revoke'
-}
-
-/**
  * Revoke a purchase that has a pending CLAIM but no grant record - a claim fallback writes the token
  * and no grant record, so this is what a refunded-but-never-claimed purchase looks like.
  *
@@ -860,26 +1073,32 @@ async function revokePendingClaim(
   event: NormalizedEvent,
   map: ProductTeamMap,
   sink: EventSink,
-): Promise<void> {
+): Promise<GrantCopy | null> {
   const txn = event.transaction_id
   const token = (await step.do(`claim-index-read:${adapter}:${txn}`, () =>
     env.ENTITLEMENTS.get(claimIndexKey(adapter, txn)),
   )) as string | null
 
   if (!token) {
-    // Neither a grant nor a claim. Two different situations look identical here, and only one of them
-    // is "nothing to do":
+    // Neither a grant nor a claim. Three different situations look identical here, and only one of
+    // them is "nothing to do":
     //   (a) this worker never sold that transaction (a stray or replayed refund) - nothing to do;
     //   (b) the refund is running AHEAD of the payment_success it belongs to. Provider events carry no
     //       ordering guarantee, so the grant may be seconds behind, and it would mint a fresh 30-day
     //       claim token for an already-refunded purchase - the very credential this function exists to
-    //       destroy, recreated after the fact.
-    // They are indistinguishable at this instant, so leave a tombstone on the guard and let the grant
-    // path refuse itself. Policy comes from the EVENT's product_id here because it is the only source
-    // that exists - there is no grant or claim record to read. That is safe in this ONE branch, and
-    // deliberately conservative: an absent or unmapped product_id falls through to `defaults`
-    // (log_only), which tombstones nothing. So the tombstone is bounded to refunds of products this
-    // deployment actually maps to auto_revoke, not to every refund the worker ever sees.
+    //       destroy, recreated after the fact;
+    //   (c) a grant is IN FLIGHT: it has not committed, and nothing here can reach a membership that
+    //       does not exist yet.
+    // They are indistinguishable at this instant, and none needs anything more from here: the refund's
+    // FIRST step already left its facts on the guard, so the grant - at entry for (b), at its commit
+    // for (c) - judges them with the policy of the product it knows it is granting. The event's own
+    // product_id cannot make that call: it is frequently empty or a line-item id, which falls through
+    // to `defaults` and would spare an auto_revoke product.
+    //
+    // When the event's product_id DOES resolve to a revoking policy, the verdict is written as well, as
+    // it always was, so the claim route refuses at once rather than after a completion is enqueued. It
+    // is written only if no grant has been committed since the refund's first step, in the same call
+    // that checks; a grant that has is handed back so the caller judges the refund by what it sold.
     const policy = resolveProductConfig(map, adapter, event.product_id)
       .revoke_policy ?? { mode: 'log_only' }
     if (revokeGate(policy, event) === 'revoke') {
@@ -887,14 +1106,23 @@ async function revokePendingClaim(
         transaction_id: txn,
         has_buyer_email: Boolean(event.buyer_email), // never log raw PII
       })
-      await guardRevoke(step, env, adapter, txn)
-      return
+      return guardRefundWrite(
+        step,
+        env,
+        'claim-guard-revoke-unless-granted',
+        adapter,
+        event,
+      )
     }
-    log('warn', 'revoke: grant record absent', {
-      transaction_id: txn,
-      has_buyer_email: Boolean(event.buyer_email), // never log raw PII
-    })
-    return
+    log(
+      'warn',
+      'revoke: grant record absent, refund recorded for the grant to judge',
+      {
+        transaction_id: txn,
+        has_buyer_email: Boolean(event.buyer_email), // never log raw PII
+      },
+    )
+    return null
   }
 
   // Read the record as TEXT and parse it here rather than asking KV for 'json'. A step callback that
@@ -921,7 +1149,7 @@ async function revokePendingClaim(
       await env.ENTITLEMENTS.delete(claimIndexKey(adapter, txn))
       return true
     })
-    return
+    return null
   }
 
   const policy = resolveProductConfig(map, adapter, claim.product_id ?? '')
@@ -937,19 +1165,19 @@ async function revokePendingClaim(
     log('info', 'revoke skipped: log_only (pending claim retained)', {
       transaction_id: txn,
     })
-    return
+    return null
   }
   if (gate === 'partial_refund') {
     log('info', 'revoke skipped: partial refund (pending claim retained)', {
       transaction_id: txn,
     })
-    return
+    return null
   }
 
   log('info', 'revoke: destroying pending claim', { transaction_id: txn })
   // Guard FIRST: it is the strongly-consistent gate, so once it is set the token is refused even
   // while the KV deletes below are still propagating.
-  await guardRevoke(step, env, adapter, txn)
+  const sequence = await guardRevoke(step, env, adapter, event)
   await consumeClaim(step, env, adapter, txn)
   await clearSubmittedMarker(step, env, adapter, txn)
 
@@ -961,7 +1189,38 @@ async function revokePendingClaim(
     github_username: null,
     teams: claim.teams ?? [],
     trigger: event.event_type,
+    ...(sequence !== undefined ? { sequence } : {}),
   })
+  return null
+}
+
+/**
+ * A refund's guard write that checks as it writes: record the refund's facts (`recordRefund`), or
+ * record them and move to `revoked` unless a grant has been committed (`revokeUnlessGranted`), and in
+ * the same call read back the committed grant copy, if there is one. Resolves to that copy while it is
+ * inside the grant record's retention window, null otherwise. The copy crosses the step boundary as a
+ * JSON string for the same reason as `ghStep`.
+ */
+async function guardRefundWrite(
+  step: WorkflowStep,
+  env: CloudflareBindings,
+  label: 'claim-guard-refund-record' | 'claim-guard-revoke-unless-granted',
+  adapter: string,
+  event: NormalizedEvent,
+): Promise<GrantCopy | null> {
+  const txn = event.transaction_id
+  const copyJson = await step.do(`${label}:${adapter}:${txn}`, async () => {
+    const guard = claimGuard(env, adapter, txn)
+    const facts = refundFacts(event)
+    const { grant } =
+      label === 'claim-guard-refund-record'
+        ? await guard.recordRefund(facts)
+        : await guard.revokeUnlessGranted(facts)
+    return grant !== null && copyExpiresAt(grant) > Date.now()
+      ? JSON.stringify(grant)
+      : null
+  })
+  return copyJson === null ? null : (JSON.parse(copyJson) as GrantCopy)
 }
 
 async function runRevoke(
@@ -974,28 +1233,66 @@ async function runRevoke(
   map: ProductTeamMap,
   sink: EventSink,
 ): Promise<void> {
-  // Read the grant record FIRST - it, not the event, is the authoritative source of which product was
-  // sold. Refund/adjustment events frequently lack a usable product_id (an adjustment/refund event may
+  // WRITE TO THE GUARD FIRST, AND DECIDE FROM WHAT THE WRITE RETURNS. The refund's facts go onto the
+  // guard in the same call that reads back whether a grant has been committed. The guard is strongly
+  // consistent, so this answers for a grant record that this KV location cannot see yet, and because
+  // the check and the write are one call, a grant cannot commit between them: a grant that committed
+  // before is returned here, and a grant that commits after finds the facts at its own commit and
+  // judges them. Reading first and writing later left exactly that gap, and a grant that fell into it
+  // kept access after the refund. The copy is used only inside the grant record's own retention window,
+  // so a dispute raised after it behaves exactly as it does with KV alone.
+  let record = await guardRefundWrite(
+    step,
+    env,
+    'claim-guard-refund-record',
+    adapter,
+    event,
+  )
+  // Then the grant record, which now serves only a grant committed before the guard kept a copy (an
+  // `idle` guard with a KV record). It, not the event, is the authoritative source of which product was
+  // sold: refund/adjustment events frequently lack a usable product_id (an adjustment/refund event may
   // reference a line-item id rather than the product, so product_id is ''), so resolving the revoke
-  // policy from the EVENT would fall
-  // through to `defaults` (log_only) and wrongly SKIP an auto_revoke product. Resolve the policy from
-  // the GRANT RECORD's product_id instead.
-  // Read as TEXT and parse outside the step, for the same reason as the claim read above: a step
-  // callback resolving to an object is what the Workflows runtime mis-records (see ghStep).
+  // policy from the EVENT would fall through to `defaults` (log_only) and wrongly SKIP an auto_revoke
+  // product.
+  // The read crosses the step boundary as TEXT and is parsed outside it, for the same reason as the
+  // claim read above: a step callback resolving to an object is what the Workflows runtime mis-records
+  // (see ghStep).
   const recordJson = await step.do(
     `grant-read:${adapter}:${event.transaction_id}`,
     () => env.ENTITLEMENTS.get(grantKey(adapter, event.transaction_id)),
   )
-  const record = (
-    recordJson === null ? null : JSON.parse(recordJson)
-  ) as GrantRecord | null
+  if (record !== null && recordJson === null) {
+    log(
+      'info',
+      'revoke: grant record not visible in KV, using the guard copy',
+      {
+        transaction_id: event.transaction_id,
+      },
+    )
+  }
+  record ??= recordJson === null ? null : (JSON.parse(recordJson) as GrantCopy)
 
   if (!record) {
-    // No grant record does NOT mean there is nothing here. A claim fallback writes a claim token and
-    // NO grant record, so this is exactly the shape a refunded-but-unclaimed purchase takes - and the
-    // token is a live bearer credential that must not outlive the refund.
-    await revokePendingClaim(step, env, org, origin, adapter, event, map, sink)
-    return
+    // No grant in either place does NOT mean there is nothing here. A claim fallback writes a claim
+    // token and NO grant record, so this is exactly the shape a refunded-but-unclaimed purchase takes -
+    // and the token is a live bearer credential that must not outlive the refund.
+    const committedMeanwhile = await revokePendingClaim(
+      step,
+      env,
+      org,
+      origin,
+      adapter,
+      event,
+      map,
+      sink,
+    )
+    if (!committedMeanwhile) return
+    log(
+      'info',
+      'revoke: a grant committed while the refund was running, judging the refund by what it sold',
+      { transaction_id: event.transaction_id },
+    )
+    record = committedMeanwhile
   }
 
   const config = resolveProductConfig(map, adapter, record.product_id)
@@ -1015,34 +1312,173 @@ async function runRevoke(
     return
   }
 
-  const username = record.github_username
-  const teams = record.teams ?? []
+  // Guard FIRST, as for a pending claim. A grant instance for this transaction that has written its
+  // record but not yet committed finds `revoked` at its commit and withdraws itself rather than
+  // announcing a grant the refund has already taken away.
+  const sequence = await guardRevoke(step, env, adapter, event)
 
-  /**
-   * Stop the revoke on a degraded token.
-   *
-   * A revoke that cannot reach GitHub must NOT look like one that succeeded. Withdrawing access is the
-   * whole promise of a refund, so when the token can no longer do it we fail loudly and leave every
-   * artifact in place:
-   *   - emit `access.failed` carrying the handle + teams, so the seller can finish by hand. BEST-EFFORT:
-   *     `emitEvent` swallows exhausted delivery, so a seller endpoint that is down for the retry window
-   *     yields no delivered event. The Errored instance below is the guarantee; the event is not.
-   *   - skip the KV cleanup, which leaves TWO different kinds of key behind, and the difference matters:
-   *     `grant:` is the DIAGNOSTIC and what a retry needs, but `claim:`/`claim_txn:` (when present) are a
-   *     live BEARER CREDENTIAL for a transaction that was just refunded. Reaching here means a grant
-   *     record EXISTS, and the paths that produce one leave no live claim beside it: a direct grant mints
-   *     no claim, and a completed claim consumes both keys. A refunded purchase whose claim is still
-   *     PENDING has no grant record at all, so it never reaches this function - it is handled by
-   *     `revokePendingClaim`, which destroys the token via the guard before any GitHub call can degrade.
-   *     Do not read that as a general guarantee: an adapter or downstream that CAN put a live claim
-   *     beside a grant record must consume it here rather than inherit this comment.
-   *   - emit NO `access.revoked` - the seller must never be told access went away when it did not;
-   *   - throw, so the instance ends Errored. Errored is the reliable half of the signature.
-   */
-  const abortOnDegradedToken = async (
-    phase: string,
-    status: number,
-  ): Promise<never> => {
+  await withdrawAccess(
+    step,
+    env,
+    org,
+    origin,
+    adapter,
+    event,
+    map,
+    sink,
+    record.github_username,
+    record.teams ?? [],
+    event.event_type,
+    sequence,
+  )
+}
+
+/**
+ * Withdraw a granted membership: ask the buyer's ledger which teams to keep, remove the rest, deal with
+ * the pending org invitation and reconcile org membership (`removeMemberships`), delete the KV
+ * artifacts, and emit `access.revoked`, with `kept_teams` when a team was kept.
+ *
+ * Shared by the revoke path and by a grant that finds, after its own last write, that the transaction
+ * was revoked while it was in flight - so the two can never drift on what withdrawing access means.
+ * `trigger` is the refund or dispute behind it, omitted from the envelopes when it is not known.
+ * `sequence` is the guard's number for the transition into `revoked`, carried on `access.revoked`.
+ */
+async function withdrawAccess(
+  step: WorkflowStep,
+  env: CloudflareBindings,
+  org: string,
+  origin: GrantOrigin | undefined,
+  adapter: string,
+  event: NormalizedEvent,
+  map: ProductTeamMap,
+  sink: EventSink,
+  username: string,
+  teams: string[],
+  trigger: string | undefined,
+  sequence: number | undefined,
+): Promise<void> {
+  const triggerField: Record<string, EnvelopeField> = trigger ? { trigger } : {}
+
+  // A degraded token stops the withdrawal loudly; see `degradedTokenAbort`.
+  const abortOnDegradedToken = degradedTokenAbort(
+    step,
+    org,
+    origin,
+    sink,
+    event,
+    username,
+    teams,
+    triggerField,
+  )
+
+  // ASK THE BUYER'S LEDGER BEFORE REMOVING ANYTHING. One atomic call removes this transaction's entry
+  // and returns every team the buyer's other entries - committed purchases and grants still in flight -
+  // entitle, and which of this grant's teams are among them. Those are KEPT. A kept team this grant
+  // wrote is recorded as a debt on the entries that keep it, so a grant among them that never commits
+  // withdraws it (`settleUncommittedGrant`). A transaction granted before the ledger existed has no
+  // entry: removing it changes nothing, records no debt, and its teams go unless a registered purchase
+  // keeps them. The org reconcile is unchanged and still reads GitHub itself.
+  const ledgerJson = await step.do(
+    `buyer-ledger-withdraw:${adapter}:${event.transaction_id}`,
+    async () =>
+      JSON.stringify(
+        isValidGithubUsername(username)
+          ? await buyerLedger(env, username).withdrawGrant(
+              ledgerKey(adapter, event.transaction_id),
+              teams,
+            )
+          : { entitled: [], kept: [] },
+      ),
+  )
+  const { entitled, kept } = JSON.parse(ledgerJson) as LedgerAnswer
+  if (kept.length > 0) {
+    log('info', 'revoke: keeping teams another purchase still entitles', {
+      transaction_id: event.transaction_id,
+      kept,
+    })
+  }
+
+  await removeMemberships(step, env, org, map, event, username, {
+    remove: teams.filter((slug) => !kept.includes(slug)),
+    kept,
+    entitled,
+    labelPrefix: '',
+    abort: abortOnDegradedToken,
+  })
+
+  // Clean up KV: pending claim (if any) + the grant record.
+  await step.do(`cleanup:${adapter}:${event.transaction_id}`, async () => {
+    const token = await env.ENTITLEMENTS.get(
+      claimIndexKey(adapter, event.transaction_id),
+    )
+    if (token) {
+      await env.ENTITLEMENTS.delete(claimKey(token))
+      await env.ENTITLEMENTS.delete(
+        claimIndexKey(adapter, event.transaction_id),
+      )
+    }
+    await env.ENTITLEMENTS.delete(grantKey(adapter, event.transaction_id))
+    return true
+  })
+  // ...and the guard's copy of the grant, now withdrawn. The status stays `revoked`.
+  await step.do(
+    `claim-guard-clear:${adapter}:${event.transaction_id}`,
+    async () => {
+      await claimGuard(env, adapter, event.transaction_id).clearGrant()
+      return true
+    },
+  )
+
+  await emitEvent(step, org, origin, sink, 'access.revoked', event, {
+    github_username: username,
+    teams,
+    ...(kept.length > 0 ? { kept_teams: kept } : {}),
+    ...triggerField,
+    ...(sequence !== undefined ? { sequence } : {}),
+  })
+}
+
+/** What a revoke's ledger call answers: see `ClaimGuard.withdrawGrant`. */
+interface LedgerAnswer {
+  entitled: string[]
+  kept: string[]
+}
+
+/**
+ * Stop a withdrawal on a degraded token.
+ *
+ * A revoke that cannot reach GitHub must NOT look like one that succeeded. Withdrawing access is the
+ * whole promise of a refund, so when the token can no longer do it we fail loudly and leave every
+ * artifact in place:
+ *   - emit `access.failed` carrying the handle + teams, so the seller can finish by hand. BEST-EFFORT:
+ *     `emitEvent` swallows exhausted delivery, so a seller endpoint that is down for the retry window
+ *     yields no delivered event. The Errored instance below is the guarantee; the event is not.
+ *   - skip the KV cleanup, which leaves TWO different kinds of key behind, and the difference matters:
+ *     `grant:` is the DIAGNOSTIC and what a retry needs, but `claim:`/`claim_txn:` (when present) are a
+ *     live BEARER CREDENTIAL for a transaction that was just refunded. Reaching here from a revoke means
+ *     a grant record EXISTS, and the paths that produce one leave no live claim beside it: a direct grant
+ *     mints no claim, and a completed claim consumes both keys. A refunded purchase whose claim is still
+ *     PENDING has no grant record at all, so it never reaches a withdrawal - it is handled by
+ *     `revokePendingClaim`, which destroys the token via the guard before any GitHub call can degrade.
+ *     The one exception is a claim completion withdrawing itself after its record write, whose token
+ *     has not been consumed yet: every caller marks the guard `revoked` before calling this, so that
+ *     token is already refused by the claim route even while its keys remain.
+ *     Do not read that as a general guarantee: an adapter or downstream that CAN put a live claim
+ *     beside a grant record must consume it here rather than inherit this comment.
+ *   - emit NO `access.revoked` - the seller must never be told access went away when it did not;
+ *   - throw, so the instance ends Errored. Errored is the reliable half of the signature.
+ */
+function degradedTokenAbort(
+  step: WorkflowStep,
+  org: string,
+  origin: GrantOrigin | undefined,
+  sink: EventSink,
+  event: NormalizedEvent,
+  username: string,
+  teams: string[],
+  triggerField: Record<string, EnvelopeField>,
+): (phase: string, status: number) => Promise<never> {
+  return async (phase, status) => {
     // The wire envelope carries only the coarse code; the phase/status detail stays in the log.
     log('error', 'revoke aborted: github token degraded', {
       transaction_id: event.transaction_id,
@@ -1055,20 +1491,57 @@ async function runRevoke(
       teams,
       status: 'failure',
       reason: 'github_token_degraded',
-      trigger: event.event_type,
+      ...triggerField,
     })
     throw new NonRetryableError(
       `revoke aborted: GitHub answered ${status} on ${phase} - the worker's token can no longer manage org members, so access was NOT withdrawn`,
     )
   }
+}
 
-  for (const slug of teams) {
+/**
+ * The GitHub half of withdrawing access, shared by a revoke and by a grant settling its debts, so the
+ * two can never drift: remove the team memberships in `remove`, deal with a pending org invitation, then
+ * reconcile org membership against live state.
+ *
+ * THE INVITATION FOLLOWS THE KEPT TEAMS. A buyer who has not accepted yet holds every team, this
+ * purchase's and any other's, only through the one pending org invitation.
+ *   - When a team of this grant is `kept`, the invitation is left alone: it still carries that team, and
+ *     every other team a purchase entitles.
+ *   - Otherwise it is cancelled, and when the buyer's other purchases still entitle teams (`entitled`),
+ *     it is re-issued for exactly those, one team PUT each, the call a grant makes. That spends one
+ *     invitation of the org's daily quota and sends the buyer a second invitation email; the alternative,
+ *     not cancelling, would leave the refunded team's invitation standing.
+ *
+ * `labelPrefix` keeps the step names of a debt settlement apart from a revoke's, because a memoized step
+ * replays its first answer.
+ */
+async function removeMemberships(
+  step: WorkflowStep,
+  env: CloudflareBindings,
+  org: string,
+  map: ProductTeamMap,
+  event: NormalizedEvent,
+  username: string,
+  plan: {
+    remove: string[]
+    kept: string[]
+    entitled: string[]
+    labelPrefix: string
+    abort: (phase: string, status: number) => Promise<never>
+  },
+): Promise<void> {
+  const { remove, kept, entitled, labelPrefix: p, abort } = plan
+
+  for (const slug of remove) {
     // DELETE is idempotent: 204 (removed) or 404 (already gone) both converge.
-    const del = await ghStep(step, env, `team-del:${slug}:${username}`, (e) =>
-      github.removeTeamMembership(e, org, slug, username),
+    const del = await ghStep(
+      step,
+      env,
+      `${p}team-del:${slug}:${username}`,
+      (e) => github.removeTeamMembership(e, org, slug, username),
     )
-    if (isDegradedToken(del))
-      await abortOnDegradedToken(`team-del:${slug}`, del.status)
+    if (isDegradedToken(del)) await abort(`team-del:${slug}`, del.status)
   }
 
   // Cancel the pending org invitation for this user. Paginate past the 100/page cap: with >100 pending
@@ -1077,13 +1550,13 @@ async function runRevoke(
   // otherwise page until a short (last) page or the safety cap. The listing + each cancel run through
   // ghStep (durable + rate-limit backoff) with per-page step ids, so a Workflow retry is idempotent.
   let inviteCancelled = false
-  let pagesExhausted = false
-  for (let page = 1; page <= INVITE_PAGE_CAP; page++) {
-    const invites = await ghStep(step, env, `invites-list#${page}`, (e) =>
+  let pagesExhausted = kept.length > 0
+  for (let page = 1; !pagesExhausted && page <= INVITE_PAGE_CAP; page++) {
+    const invites = await ghStep(step, env, `${p}invites-list#${page}`, (e) =>
       github.listInvitations(e, org, page),
     )
     if (isDegradedToken(invites))
-      await abortOnDegradedToken(`invites-list#${page}`, invites.status)
+      await abort(`invites-list#${page}`, invites.status)
     const list = Array.isArray(invites.json)
       ? (invites.json as Array<{ id?: number; login?: string }>)
       : []
@@ -1091,11 +1564,14 @@ async function runRevoke(
       (invite) => invite.login === username && typeof invite.id === 'number',
     )
     if (match) {
-      const cancel = await ghStep(step, env, `invite-cancel:${match.id}`, (e) =>
-        github.cancelInvitation(e, org, match.id as number),
+      const cancel = await ghStep(
+        step,
+        env,
+        `${p}invite-cancel:${match.id}`,
+        (e) => github.cancelInvitation(e, org, match.id as number),
       )
       if (isDegradedToken(cancel))
-        await abortOnDegradedToken(`invite-cancel:${match.id}`, cancel.status)
+        await abort(`invite-cancel:${match.id}`, cancel.status)
       inviteCancelled = true
       break
     }
@@ -1118,53 +1594,134 @@ async function runRevoke(
       },
     )
   }
+  if (inviteCancelled && entitled.length > 0) {
+    // Re-issuing puts these teams in place on the other entries' account, so they are debts of those
+    // entries exactly as a kept team is: a grant among them that never commits withdraws them.
+    await step.do(
+      `${p}buyer-ledger-reissued:${event.transaction_id}`,
+      async () => {
+        await buyerLedger(env, username).recordDebts(entitled)
+        return true
+      },
+    )
+    for (const slug of entitled) {
+      const put = await ghStep(
+        step,
+        env,
+        `${p}invite-reissue:${slug}:${username}`,
+        (e) => github.addTeamMembership(e, org, slug, username),
+      )
+      if (isDegradedToken(put))
+        await abort(`invite-reissue:${slug}`, put.status)
+      if (put.status !== 200 && put.status !== 201) {
+        log(
+          'warn',
+          'revoke: re-issuing the invitation for a kept team failed',
+          {
+            transaction_id: event.transaction_id,
+            team: slug,
+            status: put.status,
+          },
+        )
+      }
+    }
+  }
 
   // Reconcile org membership against LIVE state: drop org membership only if the user is in no
   // product team anymore (they may hold other entitlements). Never a KV scan.
   let stillInATeam = false
   for (const slug of collectAllTeams(map)) {
-    const m = await ghStep(step, env, `team-check:${slug}:${username}`, (e) =>
-      github.getTeamMembership(e, org, slug, username),
+    const m = await ghStep(
+      step,
+      env,
+      `${p}team-check:${slug}:${username}`,
+      (e) => github.getTeamMembership(e, org, slug, username),
     )
     // 401/403 answer NOTHING and must never be read as "not in a team" - doing so would drop org
     // membership from a buyer who still holds other entitlements, on the strength of a read that never
     // happened. Those two are excluded here; every other non-200 status still falls through as "not in
     // this team", which is right for the 404 that GitHub actually returns and is the deliberate limit of
     // this check - it is auth-complete, not status-complete.
-    if (isDegradedToken(m))
-      await abortOnDegradedToken(`team-check:${slug}`, m.status)
+    if (isDegradedToken(m)) await abort(`team-check:${slug}`, m.status)
     if (m.status === 200) {
       stillInATeam = true
       break
     }
   }
   if (!stillInATeam) {
-    const orgDel = await ghStep(step, env, `org-del:${username}`, (e) =>
+    const orgDel = await ghStep(step, env, `${p}org-del:${username}`, (e) =>
       github.removeOrgMembership(e, org, username),
     )
-    if (isDegradedToken(orgDel))
-      await abortOnDegradedToken(`org-del`, orgDel.status)
+    if (isDegradedToken(orgDel)) await abort(`org-del`, orgDel.status)
   }
+}
 
-  // Clean up KV: pending claim (if any) + the grant record.
-  await step.do(`cleanup:${adapter}:${event.transaction_id}`, async () => {
-    const token = await env.ENTITLEMENTS.get(
-      claimIndexKey(adapter, event.transaction_id),
-    )
-    if (token) {
-      await env.ENTITLEMENTS.delete(claimKey(token))
-      await env.ENTITLEMENTS.delete(
-        claimIndexKey(adapter, event.transaction_id),
-      )
-    }
-    await env.ENTITLEMENTS.delete(grantKey(adapter, event.transaction_id))
-    return true
+/**
+ * A grant that ends WITHOUT committing settles its place in the buyer's ledger: its entry is removed,
+ * and a team a refund of another purchase kept on this grant's account - a debt - is withdrawn when no
+ * remaining entry backs it, through the same mechanics as a revoke. The withdrawal is announced as
+ * `access.revoked` on THIS transaction, naming exactly the withdrawn teams, with no `trigger` and no
+ * `sequence` (this transaction's guard never moved to `revoked`). Nothing is withdrawn merely because
+ * the ledger does not back it: without a recorded debt there is nothing to settle.
+ *
+ * Runs after the step that ended the grant. A handle that never reached registration has no entry; a
+ * transaction whose guard says `granted` did commit, and an error thrown after its commit ends the
+ * instance, not the grant, so its entry is left alone.
+ */
+async function settleUncommittedGrant(
+  step: WorkflowStep,
+  env: CloudflareBindings,
+  org: string,
+  origin: GrantOrigin | undefined,
+  adapter: string,
+  event: NormalizedEvent,
+  map: ProductTeamMap,
+  sink: EventSink,
+): Promise<void> {
+  const username = event.github_username
+  if (!isValidGithubUsername(username)) return
+  const txn = event.transaction_id
+  const settledJson = await step.do(
+    `buyer-ledger-release:${adapter}:${txn}`,
+    async () =>
+      JSON.stringify(
+        (await claimGuard(env, adapter, txn).status()) === 'granted'
+          ? { owed: [], entitled: [] }
+          : await buyerLedger(env, username).releaseGrant(
+              ledgerKey(adapter, txn),
+            ),
+      ),
+  )
+  const { owed, entitled } = JSON.parse(settledJson) as {
+    owed: string[]
+    entitled: string[]
+  }
+  if (owed.length === 0) return
+
+  log(
+    'warn',
+    'grant ended without committing: withdrawing teams a refund kept on its account',
+    { transaction_id: txn, teams: owed },
+  )
+  await removeMemberships(step, env, org, map, event, username, {
+    remove: owed,
+    kept: [],
+    entitled,
+    labelPrefix: 'debt-',
+    abort: degradedTokenAbort(
+      step,
+      org,
+      origin,
+      sink,
+      event,
+      username,
+      owed,
+      {},
+    ),
   })
-
   await emitEvent(step, org, origin, sink, 'access.revoked', event, {
     github_username: username,
-    teams,
-    trigger: event.event_type,
+    teams: owed,
   })
 }
 
@@ -1388,6 +1945,7 @@ export async function executeAccessWorkflow(
         adapter,
         event,
         config,
+        map,
         sink,
         Boolean(params.from_claim),
       )
@@ -1431,6 +1989,17 @@ export async function executeAccessWorkflow(
           'grant_error',
         )
       }
+      // The grant ended without committing: settle its place in the buyer's ledger.
+      await settleUncommittedGrant(
+        step,
+        env,
+        org,
+        origin,
+        adapter,
+        event,
+        map,
+        sink,
+      )
     }
     throw err // mark the Workflow instance failed for observability (the event already fired)
   }

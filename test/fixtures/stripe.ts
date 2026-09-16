@@ -53,6 +53,42 @@ export const sessionUnpaid = fixture(
   '{"type":"checkout.session.completed","data":{"object":{"payment_status":"unpaid","payment_intent":"pi_unpaid"}}}',
 )
 
+/**
+ * A delayed-notification payment method (a bank debit or a voucher), the two halves of one purchase.
+ * The session completes BEFORE the money settles (`payment_status: unpaid`), and Stripe sends
+ * `checkout.session.async_payment_succeeded` for the same session once it does. Both carry the full
+ * session shape: id, payment_intent, email, product metadata and the github custom field.
+ */
+const DELAYED_SESSION_FIELDS =
+  '"id":"cs_test_delayed","payment_intent":"pi_delayed_1","customer_details":{"email":"buyer@example.com"},"metadata":{"product_id":"prod_ABC"},"custom_fields":[{"key":"github_username","text":{"value":"octocat"}}]'
+
+export const sessionDelayedUnpaid = fixture(
+  'checkout.session.completed (unpaid) - delayed payment method, money not settled yet',
+  `{"type":"checkout.session.completed","data":{"object":{${DELAYED_SESSION_FIELDS},"payment_status":"unpaid"}}}`,
+)
+
+export const sessionDelayedSucceeded = fixture(
+  'checkout.session.async_payment_succeeded - the same session once the delayed payment settles',
+  `{"type":"checkout.session.async_payment_succeeded","data":{"object":{${DELAYED_SESSION_FIELDS},"payment_status":"paid"}}}`,
+)
+
+/** The session shape a paid `completed` would carry for the same purchase - the grant must be identical. */
+export const sessionDelayedPaidCompleted = fixture(
+  'checkout.session.completed (paid) - same session as the delayed pair, for comparison',
+  `{"type":"checkout.session.completed","data":{"object":{${DELAYED_SESSION_FIELDS},"payment_status":"paid"}}}`,
+)
+
+export const sessionDelayedFailed = fixture(
+  'checkout.session.async_payment_failed - the delayed payment did not settle',
+  `{"type":"checkout.session.async_payment_failed","data":{"object":{${DELAYED_SESSION_FIELDS},"payment_status":"unpaid"}}}`,
+)
+
+/** checkout.session.completed with nothing to pay (e.g. a 100% discount). */
+export const sessionNoPaymentRequired = fixture(
+  'checkout.session.completed (no_payment_required)',
+  '{"type":"checkout.session.completed","data":{"object":{"id":"cs_test_free","payment_status":"no_payment_required","payment_intent":null,"metadata":{"product_id":"prod_ABC","github_username":"octocat"}}}}',
+)
+
 /** charge.refunded, full (amount_refunded === amount) → refund, is_full_refund true, same pi. */
 export const chargeRefundedFull = fixture(
   'charge.refunded (full) - same payment_intent as sessionPaid',

@@ -1,6 +1,6 @@
 {
   "name": "repoaccess-core",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "Sell access to a private GitHub repo on your own infrastructure, with the payment provider you already use.",
   "type": "module",
   "license": "AGPL-3.0-or-later",
@@ -21,7 +21,11 @@
     "paywall",
     "self-hosted",
     "hono",
-    "open-core"
+    "open-core",
+    "repo-access",
+    "sell-code",
+    "github-teams",
+    "access-control"
   ],
   "exports": {
     ".": "./src/lib.ts",
@@ -66,14 +70,14 @@
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.19.1",
     "@types/node": "26.1.1",
-    "hono": "4.12.34",
+    "hono": "4.13.5",
     "prettier": "3.9.5",
     "typescript": "7.0.2",
-    "vitest": "4.1.10",
+    "vitest": "4.1.11",
     "wrangler": "4.116.0"
   },
   "overrides": {
-    "sharp": "0.35.3",
+    "sharp": "0.35.4",
     "undici": "7.29.0"
   },
   "allowScripts": {

@@ -686,7 +686,7 @@ describe('AccessWorkflow - claim completion (from_claim)', () => {
     ).toMatchObject({ github_username: 'octocat', teams: ['kit-pro'] })
     const completed = events.find((e) => e.event_type === 'claim.completed')
     expect(completed).toMatchObject({ status: 'success', teams: ['kit-pro'] })
-    // Success consumes the single-use token + reverse index, and finalizes the guard (locked).
+    // Success consumes the single-use token + reverse index, and the grant's commit locked the guard.
     expect(await env.ENTITLEMENTS.get(`claim:${token}`)).toBeNull()
     expect(await env.ENTITLEMENTS.get('claim_txn:stripe:pi_1')).toBeNull()
     expect(await guardStatus()).toBe('granted')

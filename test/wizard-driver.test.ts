@@ -828,14 +828,16 @@ describe('screen wording', () => {
     expect(record.text).toContain(
       '**Developers -> Webhooks (Event destinations) -> Add destination**',
     )
+    // Four, not three: `checkout.session.async_payment_succeeded` is what grants a buyer who paid by a
+    // delayed method, and an endpoint without it never grants them.
     expect(record.text).toContain(
-      'Events - send exactly these three: `checkout.session.completed`, `charge.refunded`, `charge.dispute.created`.',
+      'Events - send exactly these four: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `charge.refunded`, `charge.dispute.created`.',
     )
     expect(record.text).toContain('**Configure destination -> Endpoint URL:**')
     // The events really are asked for before the URL, so the screen must not send the deployer hunting
     // for a URL field that is not on screen yet.
     expect(
-      record.text!.indexOf('Events - send exactly these three'),
+      record.text!.indexOf('Events - send exactly these four'),
     ).toBeLessThan(
       record.text!.indexOf('Configure destination -> Endpoint URL'),
     )
@@ -847,12 +849,14 @@ describe('screen wording', () => {
     )
   })
 
-  it('the synthetic check credits the cancellation to the check, not the worker', async () => {
-    // The cleanup is the check's own direct GitHub DELETE; it never goes through the worker.
+  it('the synthetic check credits the withdrawal to the worker, which is what does it', async () => {
+    // The cleanup is a signed refund the WORKER acts on - that is the whole point of the change, and the
+    // screen has to say whose action the deployer is about to watch. The direct GitHub DELETE still runs
+    // behind it, but as belt and braces, and nothing here credits it.
     const record = byId(await drive('sandbox', 'full'), 'synthetic-check')
     expect(record.type).toBe('say')
     expect(record.text).toContain(
-      'sends a **real** GitHub invite to `octocat-test`; the check then cancels it automatically. One invite email, one cancellation - no money, nothing to accept...',
+      'sends a **real** GitHub invite to `octocat-test`; I then send a matching refund, which is what makes your worker take the invite back. One invite email, one cancellation - no money, nothing to accept...',
     )
   })
 
@@ -863,29 +867,30 @@ describe('screen wording', () => {
     expect(
       byId(await drive('sandbox', 'quick'), 'synthetic-check').text,
     ).toContain(
-      "Synthetic check **green**. Your grant path works end to end - a signed event in, a real GitHub invite out. Refunds aren't tested here; a Full run does that.",
+      'Synthetic check **green**. Your grant path and your revoke path both work end to end - a signed event in, a real GitHub invite out, a refund in, the invite gone. No real money moved; a Full run buys and refunds for real.',
     )
   })
 
-  it('nothing ever claims the synthetic check proved the revoke path', async () => {
-    // It sends one `checkout.session.completed` and cleans up with a direct DELETE - `charge.refunded`
-    // is never sent, so the worker's revoke path is not exercised. Four strings once said it was: the
-    // goal screen's Quick option, E1's Quick close, and both Quick closings.
-    for (const goal of ['full', 'quick'] as WizardGoal[]) {
-      for (const env of ['sandbox', 'production'] as WizardEnv[]) {
-        for (const record of await drive(env, goal)) {
-          if (!['goal', 'synthetic-check', 'closing'].includes(record.id))
-            continue
-          const texts = [
-            record.text ?? '',
-            ...(record.options ?? []).map((o) => o.description),
-          ]
-          for (const text of texts) {
-            const where = `${record.id} in ${env}/${goal}`
-            expect(text, where).not.toContain('revoke plumbing')
-            expect(text, where).not.toContain('grant and revoke plumbing')
-          }
-        }
+  it('every screen that credits the synthetic refund says in the same breath that no money moved', async () => {
+    // The check now sends a `charge.refunded` of its own, so "it proved the revoke path" became TRUE and
+    // the three strings that used to deny it were corrected. The claim that must never drift is the other
+    // half: nothing here is money, and a Full run is still what buys and refunds in the Stripe dashboard.
+    // A Quick run is where that would mislead, because it never opens the dashboard at all.
+    for (const env of ['sandbox', 'production'] as WizardEnv[]) {
+      const records = await drive(env, 'quick')
+      const goal = byId(records, 'goal')
+      const quickOption = (goal.options ?? []).find((o) => o.value === 'quick')
+      const texts = [
+        quickOption?.description ?? '',
+        byId(records, 'synthetic-check').text ?? '',
+        byId(records, 'closing').text ?? '',
+      ]
+      for (const text of texts) {
+        expect(text, env).toMatch(/refund/i)
+        expect(text, env).toMatch(/no real money|synthetic|for real/i)
+        // The old denials, which the change made false. They must not come back.
+        expect(text, env).not.toContain('does not test refunds')
+        expect(text, env).not.toContain('test the refund path')
       }
     }
   })
@@ -1406,20 +1411,20 @@ describe('closings (one per env x goal)', () => {
   it('the quick sandbox closing states it never touched Stripe', async () => {
     const record = byId(await drive('sandbox', 'quick'), 'closing')
     expect(record.text).toContain(
-      'the synthetic test proved the grant path end to end: a signed event in, a real GitHub invite out, then cleaned up.',
+      'the synthetic test proved the grant and revoke paths end to end: a signed event in, a real GitHub invite out, a refund in, the invite gone.',
     )
     expect(record.text).toContain(
-      "**What this run did NOT do:** it didn't touch Stripe, prove a real purchase, or test the refund path",
+      "**What this run did NOT do:** it didn't touch Stripe or prove a real purchase - the refund it sent was synthetic, not money coming back through Stripe.",
     )
   })
 
   it('the quick production closing states it never touched Stripe', async () => {
     const record = byId(await drive('production', 'quick'), 'closing')
     expect(record.text).toContain(
-      'Done - your production worker is deployed on `access.example.com`, and the synthetic test proved the grant path end to end.',
+      'Done - your production worker is deployed on `access.example.com`, and the synthetic test proved the grant and revoke paths end to end.',
     )
     expect(record.text).toContain(
-      "**What this run did NOT do:** it didn't touch Stripe, prove a real purchase, or test the refund path",
+      "**What this run did NOT do:** it didn't touch Stripe or prove a real purchase - the refund it sent was synthetic, not money coming back through Stripe.",
     )
   })
 

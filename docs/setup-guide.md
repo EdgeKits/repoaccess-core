@@ -35,25 +35,27 @@ Two of Cloudflare's free-plan limits are the ones that bind here: **1,000 KV wri
 
 | What happens                                                  | Workflow steps | KV writes | KV deletes |
 | ------------------------------------------------------------- | -------------- | --------- | ---------- |
-| Sale in `username` mode (the handle arrived with the payment) | 6              | 2         | 0          |
-| Sale in `claim` mode (the buyer enters their handle)          | 12             | 5         | 2          |
-| Refund or chargeback, access revoked                          | 8 to 12        | 0         | 1 to 3     |
+| Sale in `username` mode (the handle arrived with the payment) | 8              | 2         | 0          |
+| Sale in `claim` mode (the buyer enters their handle)          | 14             | 6         | 2          |
+| Refund or chargeback, access revoked                          | 11 to 12       | 0         | 1          |
 
 Those figures are for the Stripe adapter, one team per product, and a buyer who is not already a
 member. One step and one write of each sale is the alias that lets your `success_url` redirect resolve
-to the purchase; an adapter whose redirect already carries the transaction id does not pay it. A revoke costs
-more the more teams your product map names, because the last thing it does before removing anyone
-from the organization is check every configured team to see what their other purchases still entitle
-them to.
+to the purchase; an adapter whose redirect already carries the transaction id does not pay it. One of the
+`claim` mode writes is made by the claim page itself when the buyer submits, not by the Workflow. A revoke
+costs 12 steps while the buyer's invitation is still pending and 11 once it is accepted, one step more for
+each further team your product map names (the last thing it does before removing anyone from the
+organization is check every configured team to see what their other purchases still entitle them to), and
+one more step plus one call per team when it re-issues an invitation for teams another purchase entitles.
 
 Divide the limits by the table and the free plan carries roughly:
 
-- **500 sales a day** in `username` mode,
-- **200 a day** in `claim` mode,
-- **150 a day** even if every single sale is refunded.
+- **about 375 sales a day** in `username` mode,
+- **about 165 a day** in `claim` mode,
+- **about 150 a day** even if every single sale is refunded.
 
-Which limit binds first changes with the mode: `username` runs out of steps and writes at the same
-point, `claim` runs out of writes first.
+Which limit binds first changes with the mode: `username` runs out of steps first, `claim` runs out of
+writes first.
 
 If you outgrow that, the Workers Paid plan is **$5 a month** and lifts the same two limits to 1
 million KV writes and 500,000 Workflow steps per month, with anything past that costing under a cent
@@ -304,8 +306,9 @@ support.
      segment for obscurity. It lives **only in this webhook URL** (and your own notes) - it is **not** a
      worker secret. Stripe signs every delivery, and signature verification is the real gate, so the
      worker doesn't validate the path.
-   - **Subscribe to exactly these three events:** `checkout.session.completed` (the purchase),
-     `charge.refunded`, and `charge.dispute.created` (the chargeback).
+   - **Subscribe to exactly these four events:** `checkout.session.completed` (the purchase),
+     `checkout.session.async_payment_succeeded` (a purchase paid by a delayed method, such as a bank
+     debit, once the money settles), `charge.refunded`, and `charge.dispute.created` (the chargeback).
 3. **Copy the webhook signing secret** (`whsec_…`) - it becomes the `STRIPE_WEBHOOK_SECRET` secret in
    Step 6.
 4. **Set `metadata.product_id`** on your Checkout Session / Payment Link (and, for `username` mode,
@@ -412,10 +415,23 @@ The options, in full:
     engine enqueued it directly instead. It is absent only where the worker never recorded the answer.
     It is there so a month's grants can be reconciled against your provider's dashboard by channel
     rather than by hand.
+  - **`kept_teams`** - on `access.revoked`, the teams the revoke left in place because another purchase by
+    the same buyer still entitles them; absent when it kept none, and `teams` still names every team on the
+    refunded grant. A purchase whose grant fails after a refund kept a team for it gets an `access.revoked`
+    of its own, naming only the team it withdraws.
+  - **`sequence`** - `access.granted`, `access.revoked`, and an `access.failed` whose `reason` is
+    `transaction_revoked` carry a number. For one transaction, the event with the higher `sequence` is
+    the current state, whatever order they arrive in; `timestamp` is when the event was sent, not an
+    ordering key. An instance that was already running when the worker was upgraded can send its event
+    without `sequence`: treat an absent `sequence` as older than any present one.
 - **`e2e`** (optional) - settings for the synthetic end-to-end check, read by setup tooling only and
   never on the request or Workflow path. **`testUsername` must be an account YOU own**: the check sends
-  it a real org invitation and then cancels it. `productId` pins which product mapping to grant into
-  (omitted, it takes the first Stripe product that maps to a team); `url` is the deployed worker to hit;
+  it a real org invitation, then takes it back by sending the worker a matching synthetic full refund -
+  so the check cleans up through the worker, leaves nothing that would make a later refund keep a team,
+  and proves the revoke path while it is at it. (On a product whose `revoke_policy` is not
+  `auto_revoke`, a refund is meant to keep access, so the refund is skipped with a warning and the
+  invitation is cancelled directly.) `productId` pins which product mapping to grant into (omitted, it
+  takes the first Stripe product that maps to a team); `url` is the deployed worker to hit;
   `secretPath` is the `/wh/stripe/:path` segment.
 
 **Auto-revoke horizon:** the worker keeps each grant record for **180 days**, so `auto_revoke` covers
@@ -437,6 +453,12 @@ than one thing, so it is worth being precise:
 1. **The teams on that grant only.** The worker removes the buyer from the teams mapped to the refunded
    product. Teams that came from a _different_ purchase are not touched.
 2. **Any pending invitation** for that buyer is cancelled (an unaccepted invite is still a grant in flight).
+   When another purchase still entitles the buyer to a team, the worker then invites them again for exactly
+   those teams, so a purchase they have not accepted yet survives the refund of a different one. That costs
+   one invitation from your organization's daily invitation quota and sends the buyer a second invitation
+   email: a buyer's unaccepted teams all travel on one organization invitation, and cancelling it is how
+   the refunded team is kept from being accepted later. When the refund keeps a team of its own (see below),
+   the invitation still carries that team and is left alone.
 3. **Org membership is then reconciled against live GitHub state.** The worker asks GitHub which of your
    configured teams the buyer is still in. If they are still in **any** of them, they **keep their org
    membership** and everything that other purchase entitles them to. Only when they are in **no** product
@@ -448,6 +470,15 @@ So the case sellers worry about is already handled: a buyer who owns product A, 
 refunds B, loses B and **keeps A**. The check is made against GitHub itself, not against the worker's
 records, so it stays correct even after a grant record has aged out of the 180-day window.
 
+> **A team two purchases share is kept while another purchase still entitles it.** If two products map to
+> the **same** team (two price points for one repository, an item and a bundle that contains it), refunding one keeps
+> that team, and any pending invitation that carries it, for as long as another purchase by the same buyer
+> still entitles it, including one whose grant is still being processed. The team goes when the last
+> purchase that entitles it is refunded, and if the purchase it was kept for fails to be granted instead,
+> the worker removes the team then. Purchases granted before 3.2.0 are not in the worker's record of
+> what each buyer holds, so they revoke as before: refunding one removes its teams unless a purchase granted
+> since still entitles them, and no refund counts an older purchase as keeping a team.
+
 > **One caveat worth knowing.** That reconciliation only looks at teams **declared in your
 > `productTeamMap`**. If you manually put a buyer in some other team (a `beta-testers` team, say), the worker
 > cannot see it, may conclude they hold nothing, and remove them from the org - which drops every team
@@ -458,6 +489,57 @@ records, so it stays correct even after a grant record has aged out of the 180-d
 > any stray webhook from an adapter you composed - falls through to `defaults`. Empty `defaults.teams`
 > is a safe no-op; a real team there becomes a **catch-all** that grants on anything. Only set a
 > non-empty `defaults` if you genuinely want a catch-all tier.
+
+### Configurations, and what the buyer sees in each
+
+The product map above decides everything a buyer experiences after paying, and GitHub sends the emails, not
+the worker (RepoAccess never emails anyone; the delivery page is the only thing it shows a buyer). Each
+of the first four configurations below was run end to end against a live organization, with a real
+payment and a real refund, before it was written down; the bundle case follows from them. Two facts hold
+for all of them:
+
+- **The invitation goes to the buyer's GitHub account, not to the checkout email.** GitHub mails it to the
+  primary address on that account, so a buyer who paid with one address and has GitHub on another will find
+  it in the other inbox. The claim page and the delivery page tell them to watch their email and their
+  GitHub notifications for it, and the notification reaches them whichever address the email went to.
+- **The invitation expires after seven days.** The worker does not re-issue it yet. If a buyer let it lapse,
+  invite them again by hand from your organization's People page; a later refund still revokes as usual,
+  because the worker cancels any pending invitation for the buyer and removes whatever teams the purchase
+  carried.
+
+**One product, one team.** The configuration the setup wizard writes. Purchase: one "invited you to join the
+organization" email from GitHub; after the buyer accepts, one "added you to the team" email. Refund: one
+"removed from the team" email and one "removed from the organization" email. Events: `access.granted`, then
+`access.revoked`.
+
+**Two products, two teams.** The buyer owns A (team `kit-a`) and later buys B (team `kit-b`). The second
+purchase sends no invitation: the buyer is already a member, so the worker adds them to the team directly
+and GitHub sends only the "added you to the team" email. Refunding B removes `kit-b` and nothing else; the
+buyer stays in the organization and keeps A, and gets one "removed from the team" email. Refunding A
+afterwards removes `kit-a` and the organization membership, with both emails.
+
+**Two products, one team.** Both map to the same team. The second purchase changes nothing on GitHub and
+sends no email at all; the worker still emits `access.granted`, because the purchase happened. Refunding
+either one changes nothing on GitHub and sends no email either: the other purchase still entitles the team,
+so the worker keeps it and says so on the event (`access.revoked` with `kept_teams`). Refunding the last one
+removes the team and the organization membership. This is the shape of a duplicate purchase (a buyer pays
+twice by mistake and you refund the second), of two price points for one repository, and of an add-on that
+maps to the team the buyer already holds.
+
+**One product, two teams.** Purchase: one invitation carrying both teams, then, after acceptance, one
+"added you to the team" email per team. Refund: both teams removed and the organization membership with
+them.
+
+**A bundle and one of its items.** The bundle maps to `['kit-a', 'kit-b']`, the item to `['kit-a']`. A buyer
+who owns the item and then buys the bundle is added to `kit-b` only (no invitation, one team email).
+Refunding the bundle removes `kit-b` and keeps `kit-a`, because the item still entitles it. Refunding the
+item keeps `kit-a` too, because the bundle still entitles it. Only when neither purchase stands does the
+team go.
+
+**A buyer who was already a member of your organization** before their first purchase, for any reason, never
+receives an invitation: every purchase adds them to teams directly, and every refund removes teams and, when
+no configured team is left, the organization membership. If they should keep that membership regardless,
+declare the team that protects it in the product map, as the caveat above explains.
 
 ### Sandbox vs production (optional)
 
@@ -638,7 +720,8 @@ purchase stays in that purchase's team, keeps that product, and never sees the o
 If a buyer with a _second, still-paid_ product does somehow lose access, that is a real bug and not this
 behavior - check that the team backing the second product is declared in your `productTeamMap` (see the
 caveat under "What a revoke actually removes"). A team the config does not know about is invisible to the
-reconciliation.
+reconciliation. The one known exception is a team both products share when one of them was bought before
+3.2.0: see the shared-team note in the same section.
 
 ---
 

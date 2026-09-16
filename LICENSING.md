@@ -37,7 +37,7 @@ That license is delivered as **RepoAccess Pro**, which also adds the additional 
 embeddable service, and support. Under it, the RepoAccess core code is licensed to you on the Pro terms and
 **not** under the AGPL, so no AGPL obligation, including the network clause, attaches to your use of it.
 
-For commercial licensing, see the [RepoAccess page](https://edgekits.dev/en/tools/repoaccess/).
+For commercial licensing, see the [RepoAccess licensing page](https://edgekits.dev/en/tools/repoaccess/licensing/).
 
 ## Why dual licensing is possible here
 

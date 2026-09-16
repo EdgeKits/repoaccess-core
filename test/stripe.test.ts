@@ -154,6 +154,82 @@ describe('stripe adapter - verification (via the route, 401 on failure)', () => 
   })
 })
 
+describe('stripe adapter - delayed payment methods (via the route)', () => {
+  // A bank debit or a voucher completes the session before the money settles. The worker must neither
+  // grant that (nothing is paid) nor answer 400 (a 400 makes Stripe retry a correct decision for days),
+  // and it must grant when Stripe reports the payment settled.
+  async function deliver(body: string) {
+    const env = mockEnv({ STRIPE_WEBHOOK_SECRET: SECRET })
+    const app = createWorker({ adapters: [stripe], config: mockConfig() })
+    const res = await app.request(
+      '/wh/stripe/whpath',
+      await signedRequest(body),
+      env,
+    )
+    const calls = (env.ACCESS_WORKFLOW.createBatch as ReturnType<typeof vi.fn>)
+      .mock.calls
+    return { res, calls }
+  }
+
+  it('a: completed with payment_status unpaid → 200, no enqueue', async () => {
+    const { res, calls } = await deliver(fx.sessionDelayedUnpaid.raw)
+    expect(res.status).toBe(200)
+    expect(calls).toHaveLength(0)
+  })
+
+  it('b: async_payment_succeeded → 200, one enqueue, the grant a paid completed would have made', async () => {
+    const { res, calls } = await deliver(fx.sessionDelayedSucceeded.raw)
+    expect(res.status).toBe(200)
+    expect(calls).toHaveLength(1)
+    const [{ id, params }] = calls[0][0]
+    expect(id).toBe('stripe-payment_success-pi_delayed_1')
+    const paid = stripe.parse(raw(fx.sessionDelayedPaidCompleted.raw))
+    expect(paid).not.toBeNull()
+    expect(params.event).toEqual(paid)
+    expect(params.event).toMatchObject({
+      transaction_id: 'pi_delayed_1',
+      product_id: 'prod_ABC',
+      buyer_email: 'buyer@example.com',
+      github_username: 'octocat',
+      redirect_alias_id: 'cs_test_delayed',
+    })
+  })
+
+  it('b2: the paid completed and the async success for one session build the same instance id', async () => {
+    const first = await deliver(fx.sessionDelayedPaidCompleted.raw)
+    const second = await deliver(fx.sessionDelayedSucceeded.raw)
+    expect(first.calls[0][0][0].id).toBe(second.calls[0][0][0].id)
+  })
+
+  it('c: completed with payment_status no_payment_required → 200, no enqueue', async () => {
+    const { res, calls } = await deliver(fx.sessionNoPaymentRequired.raw)
+    expect(res.status).toBe(200)
+    expect(calls).toHaveLength(0)
+  })
+
+  it('async_payment_failed → 200, no enqueue', async () => {
+    const { res, calls } = await deliver(fx.sessionDelayedFailed.raw)
+    expect(res.status).toBe(200)
+    expect(calls).toHaveLength(0)
+  })
+
+  it('d: an event type the adapter does not know is still 400, no enqueue', async () => {
+    const { res, calls } = await deliver(
+      JSON.stringify({ type: 'invoice.paid', data: { object: {} } }),
+    )
+    expect(res.status).toBe(400)
+    expect(calls).toHaveLength(0)
+  })
+
+  it('d: a paid completed still enqueues exactly as before', async () => {
+    const { res, calls } = await deliver(sessionPaid)
+    expect(res.status).toBe(200)
+    expect(calls).toHaveLength(1)
+    expect(calls[0][0][0].id).toBe('stripe-payment_success-pi_test_123')
+    expect(calls[0][0][0].params.event).toEqual(stripe.parse(raw(sessionPaid)))
+  })
+})
+
 describe('stripe adapter - parse()', () => {
   it('checkout.session.completed (paid) → payment_success with payment_intent + metadata username', () => {
     const event = stripe.parse(raw(sessionPaid))

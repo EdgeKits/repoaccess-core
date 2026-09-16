@@ -1,8 +1,39 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Gary Stupak
 
-import type { ProductConfig, ProductTeamMap, RepoAccessConfig } from '../types'
+import type {
+  NormalizedEvent,
+  ProductConfig,
+  ProductTeamMap,
+  RepoAccessConfig,
+  RevokePolicy,
+} from '../types'
 import { isValidGithubUsername } from '../username'
+
+/**
+ * What the seller's policy says a refund/dispute should do. Shared by every place that judges one -
+ * both revoke paths, a grant at entry, and the guard's atomic commit - so they can never drift on what
+ * a refund means. The caller logs its own reason; this decides.
+ */
+export type RevokeGate = 'revoke' | 'log_only' | 'partial_refund'
+
+export function revokeGate(
+  policy: RevokePolicy,
+  event: Pick<NormalizedEvent, 'event_type' | 'is_full_refund'>,
+): RevokeGate {
+  if (policy.mode !== 'auto_revoke') return 'log_only'
+  // A partial refund skips ONLY under `full_refund_only` - plain `auto_revoke` revokes it like any
+  // other refund. A chargeback carries `is_full_refund: null` and always revokes, whatever the flag
+  // says. And a refund that is partial NOW may be completed later: that arrives as its own instance
+  // (the id carries the scope, see workflow-id.ts), so this gate is asked again with the new answer.
+  if (
+    event.event_type === 'refund' &&
+    policy.full_refund_only &&
+    event.is_full_refund !== true
+  )
+    return 'partial_refund'
+  return 'revoke'
+}
 
 /**
  * Light runtime guard that a config-authored `productTeamMap` carries the reserved `defaults` key.

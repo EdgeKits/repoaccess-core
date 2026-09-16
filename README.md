@@ -53,7 +53,8 @@ account owner can accept it.
 than one thing:
 
 1. **Only the teams on that grant.** Teams that came from a _different_ purchase are not touched.
-2. **Any pending invitation** for that buyer is cancelled - an unaccepted invite is still a grant in flight.
+2. **Any pending invitation** for that buyer is cancelled - an unaccepted invite is still a grant in flight -
+   and issued again for any team another purchase still entitles them to.
 3. **Then org membership is reconciled against live GitHub state.** The worker asks GitHub which of your
    configured teams the buyer is still in. If they are in **any** of them they **keep their org membership**,
    and everything their other purchases entitle them to. Only when they are in **no** product team at all is
@@ -190,8 +191,8 @@ Add the Cloudflare bindings (Workflow, KV, Durable Object), put your secrets (`G
 
 ## What's in core
 
-- **Stripe** adapter: HMAC-verified `checkout.session.completed`, `charge.refunded`,
-  `charge.dispute.created`.
+- **Stripe** adapter: HMAC-verified `checkout.session.completed`,
+  `checkout.session.async_payment_succeeded`, `charge.refunded`, `charge.dispute.created`.
 - **Grant and revoke** engine: a durable Cloudflare Workflow, idempotent on retried webhooks, GitHub
   rate-limit backoff, and reconciliation around manual changes.
 - **Claim flow**: a one-time claim link plus a single-flight Durable Object so two submissions can't
@@ -233,7 +234,9 @@ AGPL-3.0-or-later. Copyright © 2026 Gary Stupak. See [LICENSE](LICENSE).
 
 If you run a modified RepoAccess as a service for others, the AGPL's network-use terms apply (see the FAQ
 below). For a closed-source or otherwise proprietary use, the licensed edition is **RepoAccess Pro** - there
-is no separate commercial license for core.
+is no separate commercial license for core. How the two editions relate, and what a commercial arrangement
+looks like, is on the [licensing page](https://edgekits.dev/en/tools/repoaccess/licensing/); the full
+explanation lives in [LICENSING.md](LICENSING.md).
 
 ## License and AGPL FAQ
 
