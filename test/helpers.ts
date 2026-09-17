@@ -148,8 +148,15 @@ afterEach(() => {
  *
  * Sleeps are recorded because the workflow suite asserts the backoff schedule. Callers that do not
  * care can ignore the array.
+ *
+ * `onSleep` runs while the instance is asleep, which is where a test lands an event that arrives in a
+ * GitHub backoff window: the production sleep is minutes to hours long, so anything can happen inside
+ * it, and a test that cannot reach that window can only assert about instants.
  */
-export function makeStep(): { step: WorkflowStep; sleeps: number[] } {
+export function makeStep(onSleep?: (ms: number) => Promise<void> | void): {
+  step: WorkflowStep
+  sleeps: number[]
+} {
   const sleeps: number[] = []
   const step = {
     // step.do has two arities: (name, fn) and (name, config, fn) - the emit and fetch-entity steps
@@ -158,9 +165,9 @@ export function makeStep(): { step: WorkflowStep; sleeps: number[] } {
       const fn = (typeof b === 'function' ? b : a) as () => unknown
       return assertStepResult(name, await fn())
     },
-    sleep: (_name: string, ms: number) => {
+    sleep: async (_name: string, ms: number) => {
       sleeps.push(ms)
-      return Promise.resolve()
+      if (onSleep) await onSleep(ms)
     },
     sleepUntil: () => Promise.resolve(),
   }

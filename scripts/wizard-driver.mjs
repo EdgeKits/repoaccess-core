@@ -2135,7 +2135,7 @@ const SCREENS = [
           value: 'quick',
           label: 'Quick check',
           description:
-            'deploy the worker and run a synthetic end-to-end test that proves the grant and revoke paths: a signed event resolves to a team and produces a real GitHub invite, and a signed refund takes it back. No real money moves and no Stripe dashboard - a Full run buys and refunds for real. Faster. Choose this to verify the wiring.',
+            'deploy the worker and run a synthetic end-to-end test that proves the grant and revoke paths: a signed event resolves to a team and produces a real GitHub invite, and a signed refund takes it back if you choose automatic revoke - under Log only the refund is skipped and the run says so. No real money moves and no Stripe dashboard - a Full run buys and refunds for real. Faster. Choose this to verify the wiring.',
         },
       ],
     }),

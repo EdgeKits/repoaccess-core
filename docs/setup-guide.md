@@ -36,7 +36,7 @@ Two of Cloudflare's free-plan limits are the ones that bind here: **1,000 KV wri
 | What happens                                                  | Workflow steps | KV writes | KV deletes |
 | ------------------------------------------------------------- | -------------- | --------- | ---------- |
 | Sale in `username` mode (the handle arrived with the payment) | 8              | 2         | 0          |
-| Sale in `claim` mode (the buyer enters their handle)          | 14             | 6         | 2          |
+| Sale in `claim` mode (the buyer enters their handle)          | 13             | 5         | 2          |
 | Refund or chargeback, access revoked                          | 11 to 12       | 0         | 1          |
 
 Those figures are for the Stripe adapter, one team per product, and a buyer who is not already a
@@ -51,7 +51,7 @@ one more step plus one call per team when it re-issues an invitation for teams a
 Divide the limits by the table and the free plan carries roughly:
 
 - **about 375 sales a day** in `username` mode,
-- **about 165 a day** in `claim` mode,
+- **about 200 a day** in `claim` mode,
 - **about 150 a day** even if every single sale is refunded.
 
 Which limit binds first changes with the mode: `username` runs out of steps first, `claim` runs out of
@@ -424,6 +424,8 @@ The options, in full:
     the current state, whatever order they arrive in; `timestamp` is when the event was sent, not an
     ordering key. An instance that was already running when the worker was upgraded can send its event
     without `sequence`: treat an absent `sequence` as older than any present one.
+    An `access.failed` with reason `transaction_revoked` and the `access.revoked` for the same transaction
+    can share a `sequence`: they describe one transition, the refund's, and neither outranks the other.
 - **`e2e`** (optional) - settings for the synthetic end-to-end check, read by setup tooling only and
   never on the request or Workflow path. **`testUsername` must be an account YOU own**: the check sends
   it a real org invitation, then takes it back by sending the worker a matching synthetic full refund -

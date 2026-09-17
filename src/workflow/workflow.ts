@@ -167,6 +167,26 @@ function backoffMs(result: GithubResult, attempt: number): number {
 }
 
 /**
+ * A precondition a GitHub op re-reads inside every attempt it makes. Resolves to the REASON not to
+ * write - carried back to the caller so it does not have to read the same state a second time - or to
+ * null to go ahead. Whatever it resolves to crosses a durable step boundary as JSON, so it must be
+ * JSON-serializable.
+ */
+type SkipHook<Reason> = (env: CloudflareBindings) => Promise<Reason | null>
+
+/** What an attempt resolves to when its precondition said do not write. No GitHub call was made. */
+interface Skipped<Reason> {
+  skipped: true
+  reason: Reason
+}
+
+function isSkipped<Reason>(
+  result: GithubResult | Skipped<Reason>,
+): result is Skipped<Reason> {
+  return 'skipped' in result
+}
+
+/**
  * Run one GitHub op inside a durable step. 5xx and rate-limit (429 / 403+signal) → `step.sleep`
  * backoff and retry (NEVER fail the grant on a transient/limit) up to a generous cap.
  * Returns the result for the caller to classify (e.g. 404 vs 200).
@@ -177,19 +197,47 @@ function backoffMs(result: GithubResult, attempt: number): number {
  * hung and would never generate a response" message, even though the step and the instance both
  * complete successfully. A callback resolving to a string (or to nothing) is recorded cleanly. The
  * value is still persisted and replayed on a retry, so nothing about durability changes.
+ *
+ * `skipIf` is an OPTIONAL precondition, read at the top of EVERY attempt and INSIDE the attempt's own
+ * step. It is a hook rather than behaviour every caller gets, because only a caller that knows its
+ * write may become unwanted mid-flight can say so: a withdrawal must never acquire a check that could
+ * stop it. When the hook answers with a reason, this attempt asks GitHub for nothing and resolves to
+ * that reason instead of a result. Why the read belongs here and not only at the caller's entry: the
+ * attempts of one op are separated by a backoff sleep that can last hours and by suspensions that can
+ * last longer, and a check outside them is a memoized step that replays its old answer across both.
  */
-async function ghStep(
+function ghStep(
   step: WorkflowStep,
   env: CloudflareBindings,
   label: string,
   op: (env: CloudflareBindings) => Promise<GithubResult>,
-): Promise<GithubResult> {
+): Promise<GithubResult>
+function ghStep<Reason>(
+  step: WorkflowStep,
+  env: CloudflareBindings,
+  label: string,
+  op: (env: CloudflareBindings) => Promise<GithubResult>,
+  skipIf: SkipHook<Reason>,
+): Promise<GithubResult | Skipped<Reason>>
+async function ghStep<Reason>(
+  step: WorkflowStep,
+  env: CloudflareBindings,
+  label: string,
+  op: (env: CloudflareBindings) => Promise<GithubResult>,
+  skipIf?: SkipHook<Reason>,
+): Promise<GithubResult | Skipped<Reason>> {
   for (let attempt = 0; attempt <= MAX_GH_ATTEMPTS; attempt++) {
     const result = JSON.parse(
-      await step.do(`${label}#${attempt}`, async () =>
-        JSON.stringify(await op(env)),
-      ),
-    ) as GithubResult
+      await step.do(`${label}#${attempt}`, async () => {
+        const reason = skipIf ? await skipIf(env) : null
+        return JSON.stringify(
+          reason === null ? await op(env) : { skipped: true, reason },
+        )
+      }),
+    ) as GithubResult | Skipped<Reason>
+    // Handed back before any status classification: a skip is not a GitHub answer, and the attempt
+    // that reports one never reached GitHub at all.
+    if (isSkipped(result)) return result
     if (result.status < 500 && !isRateLimited(result)) return result
     if (attempt === MAX_GH_ATTEMPTS) {
       throw new NonRetryableError(
@@ -475,10 +523,35 @@ async function runGrant(
       )
       return
     }
-    // PUT auto-invites non-members; an existing org member is added directly.
-    const put = await ghStep(step, env, `team-put:${slug}:${username}`, (e) =>
-      github.addTeamMembership(e, org, slug, username),
+    // PUT auto-invites non-members; an existing org member is added directly - and it is also what
+    // creates the pending invitation, so the precondition below covers that shape too. Every attempt
+    // re-reads the revoke guard first (`revokedBeforeWrite`): the write is what makes the buyer a
+    // member, so the write is what asks whether the purchase still stands.
+    const put = await ghStep(
+      step,
+      env,
+      `team-put:${slug}:${username}`,
+      (e) => github.addTeamMembership(e, org, slug, username),
+      revokedBeforeWrite(adapter, event, policy),
     )
+    if (isSkipped(put)) {
+      await abandonRevokedGrant(
+        step,
+        env,
+        org,
+        origin,
+        adapter,
+        event,
+        map,
+        sink,
+        teams,
+        username,
+        grantedTeams,
+        put.reason,
+        fromClaim,
+      )
+      return
+    }
     if (put.status !== 200 && put.status !== 201) {
       const userNotFound = put.status === 404
       // 404 = the GitHub login does not exist (user not found). For a NON-claim grant the buyer's
@@ -722,9 +795,8 @@ async function fail(
   username: string | null,
   reason: AccessFailedReason,
   detail?: string,
-  // For a `transaction_revoked` refusal only: the refund or dispute behind it when the guard recorded
-  // one, and the sequence of the transition into `revoked`. Each is omitted when unknown, never guessed.
-  revocation: { trigger?: RefundFacts['event_type']; sequence?: number } = {},
+  // For a `transaction_revoked` refusal only: what the guard knows about the refund behind it.
+  revocation: Revocation = {},
 ): Promise<void> {
   const { trigger, sequence } = revocation
   // The wire envelope carries ONLY the coarse code; the raw detail stays in the log.
@@ -886,6 +958,15 @@ async function guardSnapshot(
   return JSON.parse(json) as GuardSnapshot
 }
 
+/**
+ * What a refusal knows about the refund or dispute behind it: which of the two it was, and the guard's
+ * sequence for the transition into `revoked`. Each is omitted when unknown, never guessed.
+ */
+type Revocation = {
+  trigger?: RefundFacts['event_type']
+  sequence?: number
+}
+
 type RefundVerdict =
   | { revoked: false }
   | {
@@ -953,6 +1034,122 @@ async function guardPromote(
       claimGuard(env, adapter, txn).revoke(facts),
     ),
   )
+}
+
+/**
+ * The precondition of every grant-side GitHub write: this transaction has not been revoked.
+ *
+ * It is the same judgement the grant already makes at its entry and again at its commit -
+ * `refundVerdict` under THIS grant's product policy, so a log_only product still grants after a refund
+ * it was told to ignore - re-read inside the write attempt itself. Entry and commit leave the write
+ * sitting inside two windows: a GitHub backoff sleep, which runs for hours, and a suspension (a
+ * deploy, an eviction, a pause from the dashboard), which has no bound at all. A refund that lands in
+ * either is invisible to a memoized check, and the buyer is then a member from the PUT until the
+ * refund's own DELETE. Read here, only the PUT's own in-flight latency is left, and that one is
+ * irreducible. A crash inside the attempt records nothing, so the replay re-runs this and re-reads.
+ *
+ * The verdict is promoted to the guard's `revoked` status HERE, inside the attempt's own step, for two
+ * reasons: the refusal costs no step of its own, so the shape of a grant does not move; and the facts
+ * travel back with the skip, so the caller announces the refusal without reading the guard again.
+ */
+function revokedBeforeWrite(
+  adapter: string,
+  event: NormalizedEvent,
+  policy: RevokePolicy,
+): SkipHook<Revocation> {
+  return async (env) => {
+    const guard = claimGuard(env, adapter, event.transaction_id)
+    const verdict = refundVerdict(await guard.snapshot(), policy)
+    if (!verdict.revoked) return null
+    return {
+      trigger: verdict.trigger,
+      sequence: verdict.alreadyMarked
+        ? asSequence(verdict.sequence)
+        : asSequence(await guard.revoke(verdict.facts)),
+    }
+  }
+}
+
+/**
+ * End a grant whose write found the transaction revoked. The guard is already `revoked` (the read that
+ * refused the write promoted it), so this announces the refusal and undoes whatever this grant had
+ * managed to do - the same ending a refused commit reaches, through the same code, so the two can
+ * never drift on what withdrawing access means.
+ */
+async function abandonRevokedGrant(
+  step: WorkflowStep,
+  env: CloudflareBindings,
+  org: string,
+  origin: GrantOrigin | undefined,
+  adapter: string,
+  event: NormalizedEvent,
+  map: ProductTeamMap,
+  sink: EventSink,
+  teams: string[],
+  username: string,
+  grantedTeams: string[],
+  revocation: Revocation,
+  fromClaim: boolean,
+): Promise<void> {
+  log(
+    'warn',
+    'grant abandoned: the transaction was revoked before this write',
+    {
+      adapter,
+      transaction_id: event.transaction_id,
+      from_claim: fromClaim,
+      origin,
+    },
+  )
+  await fail(
+    step,
+    org,
+    origin,
+    event,
+    sink,
+    teams,
+    username,
+    'transaction_revoked',
+    'refund/dispute landed while the grant was in flight',
+    revocation,
+  )
+  if (grantedTeams.length > 0) {
+    // An earlier team of this same grant is already on the buyer's account: withdraw it, cancel the
+    // pending invitation the PUT created, and clear the KV artifacts - the claim token included.
+    await withdrawAccess(
+      step,
+      env,
+      org,
+      origin,
+      adapter,
+      event,
+      map,
+      sink,
+      username,
+      grantedTeams,
+      revocation.trigger,
+      revocation.sequence,
+    )
+  } else {
+    // Nothing of this grant reached GitHub, so there is nothing to withdraw and a withdrawal would be
+    // WRONG here: its org reconcile can drop a membership this transaction never created. What does
+    // need settling is the ledger entry registered before the first write - and the claim token, which
+    // is a 30-day bearer credential for a purchase that is now dead. The guard refuses it either way;
+    // deleting it is what stops it being read at all.
+    await settleUncommittedGrant(
+      step,
+      env,
+      org,
+      origin,
+      adapter,
+      event,
+      map,
+      sink,
+    )
+    await consumeClaim(step, env, adapter, event.transaction_id)
+  }
+  if (fromClaim)
+    await clearSubmittedMarker(step, env, adapter, event.transaction_id)
 }
 
 /** Delete the single-use claim token (+ reverse index) for this transaction, if one exists. */
@@ -1338,8 +1535,9 @@ async function runRevoke(
  * the pending org invitation and reconcile org membership (`removeMemberships`), delete the KV
  * artifacts, and emit `access.revoked`, with `kept_teams` when a team was kept.
  *
- * Shared by the revoke path and by a grant that finds, after its own last write, that the transaction
- * was revoked while it was in flight - so the two can never drift on what withdrawing access means.
+ * Shared by the revoke path and by a grant that finds the transaction revoked while it was in flight -
+ * at its commit, after the last write, or inside a write attempt that then made no call at all - so the
+ * paths can never drift on what withdrawing access means.
  * `trigger` is the refund or dispute behind it, omitted from the envelopes when it is not known.
  * `sequence` is the guard's number for the transition into `revoked`, carried on `access.revoked`.
  */
@@ -1455,14 +1653,16 @@ interface LedgerAnswer {
  *     yields no delivered event. The Errored instance below is the guarantee; the event is not.
  *   - skip the KV cleanup, which leaves TWO different kinds of key behind, and the difference matters:
  *     `grant:` is the DIAGNOSTIC and what a retry needs, but `claim:`/`claim_txn:` (when present) are a
- *     live BEARER CREDENTIAL for a transaction that was just refunded. Reaching here from a revoke means
+ *     live BEARER CREDENTIAL for a transaction that was just refunded. Reaching here from a REVOKE means
  *     a grant record EXISTS, and the paths that produce one leave no live claim beside it: a direct grant
  *     mints no claim, and a completed claim consumes both keys. A refunded purchase whose claim is still
  *     PENDING has no grant record at all, so it never reaches a withdrawal - it is handled by
  *     `revokePendingClaim`, which destroys the token via the guard before any GitHub call can degrade.
- *     The one exception is a claim completion withdrawing itself after its record write, whose token
- *     has not been consumed yet: every caller marks the guard `revoked` before calling this, so that
- *     token is already refused by the claim route even while its keys remain.
+ *     The exceptions are the two ways a CLAIM COMPLETION withdraws ITSELF, and neither has consumed its
+ *     token yet: a refused commit after its record write, and a write attempt that found the transaction
+ *     revoked and abandoned the grant before writing any record at all. Both are covered by the same
+ *     thing: every caller marks the guard `revoked` before calling this, so the token is already
+ *     refused by the claim route even while its keys remain.
  *     Do not read that as a general guarantee: an adapter or downstream that CAN put a live claim
  *     beside a grant record must consume it here rather than inherit this comment.
  *   - emit NO `access.revoked` - the seller must never be told access went away when it did not;

@@ -1,6 +1,6 @@
 {
   "name": "repoaccess-core",
-  "version": "3.2.0",
+  "version": "3.2.1",
   "description": "Sell access to a private GitHub repo on your own infrastructure, with the payment provider you already use.",
   "type": "module",
   "license": "AGPL-3.0-or-later",

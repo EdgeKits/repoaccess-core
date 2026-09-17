@@ -11,6 +11,7 @@ import type { WorkflowStep } from 'cloudflare:workers'
 import { makeMemoStep, makeStep } from './helpers'
 import { executeAccessWorkflow } from '../src/workflow/workflow'
 import { claimGuard } from '../src/claim/claim-guard'
+import { completeClaim } from '../src/claim/claim'
 import type { EventEnvelope } from '../src/events'
 import type {
   AccessWorkflowParams,
@@ -64,6 +65,12 @@ const PTM: ProductTeamMap = {
       grant_mode: 'username',
       revoke_policy: { mode: 'auto_revoke', full_refund_only: true },
     },
+    // Two teams, so a refund can land BETWEEN the writes of one grant.
+    prod_two: {
+      teams: ['kit-pro', 'kit-extra'],
+      grant_mode: 'username',
+      revoke_policy: { mode: 'auto_revoke' },
+    },
   },
   // The sold product is auto_revoke, the defaults are log_only: a refund event whose own product id
   // is empty resolves to the defaults, which is the ordering that used to skip the tombstone.
@@ -104,12 +111,23 @@ const refund = (over: Partial<NormalizedEvent> = {}) =>
   })
 
 /**
- * A GitHub that remembers membership. `onPut` runs BEFORE the PUT is answered, which is where a test
- * lands the refund: after the grant's entry check, before its write.
+ * A GitHub that remembers membership AND pending invitations. `onPut` runs BEFORE the PUT is answered,
+ * which is where a test lands the refund: after the grant's entry check, before its write.
+ *
+ * `putStatuses` scripts the answer to each PUT in order (anything other than 200/201 leaves membership
+ * untouched), so a test can make a write back off and land its refund inside the sleep that follows.
+ * A PUT that succeeds creates the pending invitation the real API creates, and the withdrawal's
+ * list/cancel pair is answered from the same ledger - which is what lets a test assert that the
+ * invitation of an abandoned grant is gone rather than assuming it.
  */
-function fakeGithub(onPut?: () => Promise<unknown>) {
+function fakeGithub(
+  onPut?: () => Promise<unknown>,
+  putStatuses: number[] = [],
+) {
   const members = new Set<string>()
+  const invitations = new Map<number, string>()
   const calls: string[] = []
+  let nextInvitationId = 1
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
     const url = typeof input === 'string' ? input : (input as Request).url
     const path = url.replace('https://api.github.com', '')
@@ -129,7 +147,12 @@ function fakeGithub(onPut?: () => Promise<unknown>) {
         return json(members.has(key) ? 200 : 404, { state: 'pending' })
       if (method === 'PUT') {
         if (onPut) await onPut()
+        const scripted = putStatuses.shift()
+        if (scripted !== undefined && scripted !== 200 && scripted !== 201)
+          return json(scripted)
         members.add(key)
+        if (![...invitations.values()].includes(team[2]))
+          invitations.set(nextInvitationId++, team[2])
         return json(200, { state: 'pending' })
       }
       if (method === 'DELETE') {
@@ -138,13 +161,22 @@ function fakeGithub(onPut?: () => Promise<unknown>) {
       }
     }
     if (method === 'GET' && path.startsWith(`/orgs/${ORG}/invitations`))
-      return json(200, [])
+      return json(
+        200,
+        [...invitations].map(([id, login]) => ({ id, login })),
+      )
+    if (method === 'DELETE' && path.startsWith(`/orgs/${ORG}/invitations/`)) {
+      invitations.delete(Number(path.slice(path.lastIndexOf('/') + 1)))
+      return json(204)
+    }
     if (method === 'DELETE' && path.startsWith(`/orgs/${ORG}/memberships/`))
       return json(204)
     return json(500)
   })
-  return { members, calls }
+  return { members, invitations, calls }
 }
+
+const putsIn = (calls: string[]) => calls.filter((c) => c.startsWith('PUT'))
 
 const recorder = () => {
   const events: EventEnvelope[] = []
@@ -379,5 +411,235 @@ describe('a refund that lands while a grant is in flight', () => {
     // Every guard read in the instance carries its own label.
     const guardReads = memo.names.filter((n) => n.startsWith('claim-guard-'))
     expect(new Set(guardReads).size).toBe(guardReads.length)
+  })
+})
+
+// AND THE WRITE ITSELF RE-READS IT.
+//
+// Entry and commit BRACKET the GitHub writes; they do not cover the ground between them, and that
+// ground is what a membership is actually made of. Two windows sit inside it: the backoff sleep after
+// a 5xx, which runs for hours, and a suspension - a deploy, an eviction, a pause from the dashboard -
+// which has no bound at all. A refund landing in either used to be seen only at the commit, AFTER the
+// PUT had already put the buyer in the team, so access existed for the whole PUT-to-DELETE interval.
+// So every grant-side write re-reads the guard INSIDE its own attempt, and an attempt that finds the
+// transaction revoked asks GitHub for nothing. Only the PUT's own in-flight latency is irreducible.
+describe('a refund that lands between the attempts of a grant-side write', () => {
+  it('during the GitHub backoff sleep: the next attempt makes no PUT at all', async () => {
+    const env = makeEnv()
+    // The first attempt answers 503, so the grant sleeps - and the refund runs as its own instance
+    // inside that sleep, which is the ordering that reaches production.
+    let landed = false
+    const gh = fakeGithub(undefined, [503])
+    const { step } = makeStep(async () => {
+      if (landed) return
+      landed = true
+      await run(
+        makeStep().step,
+        env,
+        { adapter: 'stripe', event: refund({ product_id: '' }) },
+        () => {},
+      )
+    })
+    const { events, sink } = recorder()
+
+    await run(step, env, { adapter: 'stripe', event: evt() }, sink)
+
+    // One PUT: the one that backed off. The second attempt read the guard and stopped.
+    expect(putsIn(gh.calls)).toHaveLength(1)
+    expect([...gh.members]).toEqual([])
+    expect([...gh.invitations]).toEqual([])
+    expect(await env.ENTITLEMENTS.get(`grant:stripe:${TXN}`)).toBeNull()
+    expect(await claimGuard(env, 'stripe', TXN).status()).toBe('revoked')
+    expect(typesOf(events)).not.toContain('access.granted')
+    const failed = events.find((e) => e.event_type === 'access.failed')
+    expect(failed).toMatchObject({
+      reason: 'transaction_revoked',
+      trigger: 'refund',
+    })
+    // The verdict was promoted inside the attempt, so the refusal carries the guard's own number.
+    expect(typeof failed?.sequence).toBe('number')
+  })
+
+  it('while the instance is suspended before the PUT: the replay makes no PUT either', async () => {
+    const env = makeEnv()
+    const gh = fakeGithub()
+    // Halt the instance after the team read, so the PUT attempt's step never runs and records
+    // nothing. That is what a pause is, and it is why the read has to live inside the closure: the
+    // replay re-runs it, and a check that had completed earlier would only replay its stale answer.
+    const memo = makeMemoStep('team-get:kit-pro:octocat')
+    const first = recorder()
+
+    await run(
+      memo.step,
+      env,
+      { adapter: 'stripe', event: evt() },
+      first.sink,
+    ).catch(() => {})
+    expect(putsIn(gh.calls)).toEqual([])
+
+    // The refund lands while the instance is not running at all.
+    await run(
+      makeStep().step,
+      env,
+      { adapter: 'stripe', event: refund({ product_id: '' }) },
+      () => {},
+    )
+
+    memo.resume()
+    const second = recorder()
+    await run(memo.step, env, { adapter: 'stripe', event: evt() }, second.sink)
+
+    expect(putsIn(gh.calls)).toEqual([])
+    expect([...gh.members]).toEqual([])
+    expect([...gh.invitations]).toEqual([])
+    expect(await env.ENTITLEMENTS.get(`grant:stripe:${TXN}`)).toBeNull()
+    expect(await claimGuard(env, 'stripe', TXN).status()).toBe('revoked')
+    const all = [...first.events, ...second.events]
+    expect(typesOf(all)).not.toContain('access.granted')
+    expect(all.find((e) => e.event_type === 'access.failed')).toMatchObject({
+      reason: 'transaction_revoked',
+      trigger: 'refund',
+    })
+  })
+
+  it('between the two teams of one grant: the second attempt skips and the first team is withdrawn', async () => {
+    const env = makeEnv()
+    // kit-pro's PUT lands; kit-extra's first attempt backs off, and the refund arrives in that sleep.
+    let landed = false
+    const gh = fakeGithub(undefined, [200, 503])
+    const { step } = makeStep(async () => {
+      if (landed) return
+      landed = true
+      await run(
+        makeStep().step,
+        env,
+        { adapter: 'stripe', event: refund({ product_id: '' }) },
+        () => {},
+      )
+    })
+    const { events, sink } = recorder()
+
+    await run(
+      step,
+      env,
+      { adapter: 'stripe', event: evt({ product_id: 'prod_two' }) },
+      sink,
+    )
+
+    expect(putsIn(gh.calls)).toHaveLength(2) // kit-pro, then kit-extra's 503. No third.
+    expect(gh.calls).toContain(
+      `DELETE /orgs/${ORG}/teams/kit-pro/memberships/octocat`,
+    )
+    expect([...gh.members]).toEqual([])
+    expect([...gh.invitations]).toEqual([]) // the invitation the first PUT created is cancelled
+    expect(await env.ENTITLEMENTS.get(`grant:stripe:${TXN}`)).toBeNull()
+    expect(typesOf(events)).not.toContain('access.granted')
+    // One refusal and ONE withdrawal: the abandoned grant reuses the revoke's own code rather than
+    // writing a second one beside it.
+    expect(typesOf(events).filter((t) => t === 'access.failed')).toHaveLength(1)
+    expect(typesOf(events).filter((t) => t === 'access.revoked')).toHaveLength(
+      1,
+    )
+  })
+
+  it('the claim path: the refund lands in the completion backoff, and the token is consumed', async () => {
+    const env = makeEnv()
+    const token = 'tok_race'
+    await env.ENTITLEMENTS.put(
+      `claim:${token}`,
+      JSON.stringify({
+        adapter: 'stripe',
+        product_id: 'prod_auto',
+        teams: ['kit-pro'],
+        buyer_email: null,
+        transaction_id: TXN,
+        expires_at: Math.floor(Date.now() / 1000) + 3600,
+        origin: 'webhook',
+      }),
+      { expirationTtl: 3600 },
+    )
+    await env.ENTITLEMENTS.put(`claim_txn:stripe:${TXN}`, token, {
+      expirationTtl: 3600,
+    })
+    // Submit through the real engine, so the completion runs on the params IT enqueued, and with the
+    // single-flight lock it acquired, rather than on a hand-built approximation of them.
+    const enqueued: AccessWorkflowParams[] = []
+    const claimEnv = {
+      ...env,
+      ACCESS_WORKFLOW: {
+        createBatch: async (batch: { params: AccessWorkflowParams }[]) => {
+          enqueued.push(...batch.map((b) => b.params))
+          return []
+        },
+      },
+    } as unknown as CloudflareBindings
+    const submit = await completeClaim(claimEnv, config, token, 'octocat')
+    expect(submit.status).toBe('submitted')
+
+    let landed = false
+    const gh = fakeGithub(undefined, [503])
+    const { step } = makeStep(async () => {
+      if (landed) return
+      landed = true
+      await run(
+        makeStep().step,
+        env,
+        { adapter: 'stripe', event: refund({ product_id: '' }) },
+        () => {},
+      )
+    })
+    const { events, sink } = recorder()
+
+    await run(step, env, enqueued[0], sink)
+
+    expect(putsIn(gh.calls)).toHaveLength(1)
+    expect([...gh.members]).toEqual([])
+    expect(await env.ENTITLEMENTS.get(`grant:stripe:${TXN}`)).toBeNull()
+    expect(await env.ENTITLEMENTS.get(`claim:${token}`)).toBeNull()
+    expect(await env.ENTITLEMENTS.get(`claim_txn:stripe:${TXN}`)).toBeNull()
+    expect(
+      await env.ENTITLEMENTS.get(`claim_submitted:stripe:${TXN}`),
+    ).toBeNull()
+    // Consumed, and not redeemable by any later submit.
+    expect(
+      (await completeClaim(claimEnv, config, token, 'octocat')).status,
+    ).toBe('not_found')
+    expect(await claimGuard(env, 'stripe', TXN).status()).toBe('revoked')
+    expect(typesOf(events)).not.toContain('access.granted')
+    expect(typesOf(events)).not.toContain('claim.completed')
+    expect(events.find((e) => e.event_type === 'access.failed')).toMatchObject({
+      reason: 'transaction_revoked',
+      trigger: 'refund',
+    })
+  })
+
+  it('log_only: the refund lands during the backoff and the PUT still happens', async () => {
+    const env = makeEnv()
+    let landed = false
+    const gh = fakeGithub(undefined, [503])
+    const { step } = makeStep(async () => {
+      if (landed) return
+      landed = true
+      await run(
+        makeStep().step,
+        env,
+        { adapter: 'stripe', event: refund({ product_id: '' }) },
+        () => {},
+      )
+    })
+    const { events, sink } = recorder()
+
+    await run(
+      step,
+      env,
+      { adapter: 'stripe', event: evt({ product_id: 'prod_log' }) },
+      sink,
+    )
+
+    // The verdict is read under THIS product's policy, so a refund the seller told the worker to
+    // ignore does not stop the write. That is the policy working, not a hole in the check.
+    expect(putsIn(gh.calls)).toHaveLength(2)
+    expect([...gh.members]).toEqual(['kit-pro:octocat'])
+    expect(typesOf(events)).toEqual(['access.granted'])
   })
 })

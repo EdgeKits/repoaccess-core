@@ -11,6 +11,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions fol
 
 Nothing yet.
 
+## [3.2.1] - 2026-09-17
+
+### Fixed
+
+- A refund that completes while a grant is waiting - asleep in GitHub backoff, or paused from the
+  Workflows dashboard - is now seen before the write, not after it. In 3.2.0 the grant checked the
+  transaction on entry and again at commit; the GitHub write in between did not, so a grant that
+  resumed after such a refund still added the buyer and then removed them again. Every write attempt
+  now re-reads the transaction first and makes no GitHub call if it has been refunded; the grant ends
+  with `access.failed`, reason `transaction_revoked`, and withdraws anything it had already written.
+  What remains is the write's own in-flight latency, which the commit check covers as before. No step
+  was added, so this version can be deployed with instances in flight.
+- The setup guide's cost table said a `claim` sale costs 14 Workflow steps and 6 KV writes. It costs
+  13 and 5: the redirect alias was counted on both instances of a claim sale and is written once. The
+  free-plan figure for `claim` mode moves from about 165 to about 200 sales a day.
+
+### Added
+
+- The cost table is now asserted by a test against a measured run of the workflow, so a change to
+  either the engine or the guide that moves them apart fails the suite.
+
+### Changed
+
+- The setup wizard's Quick goal says the synthetic refund half of its check applies under an automatic
+  revoke policy; under Log only the refund is skipped and the run says so.
+- `access.failed` with reason `transaction_revoked` and the `access.revoked` for the same transaction
+  can carry the same `sequence`: they describe one transition, the refund's.
+
 ## [3.2.0] - 2026-09-16
 
 ### Fixed
