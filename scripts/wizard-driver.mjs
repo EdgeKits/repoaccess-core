@@ -319,8 +319,9 @@ Open the product and copy its **product id** (\`prod_...\`, on the product page)
 //
 // The button is **Create test payment link** in Test mode, not "New" - live-confirmed in the dashboard
 // (2026-07-16), and the wizard only ever runs Stripe in Test mode, so that is the only name a deployer
-// on this screen can see.
-const PAYMENT_LINK = `Create a Payment Link: **Payment Links -> Create test payment link -> Products or subscriptions**, select your product, quantity 1. Three things matter:
+// on this screen can see. Payment links are a tab under Checkout, not a top-level menu item
+// (live-confirmed 2026-10-03).
+const PAYMENT_LINK = `Create a Payment Link: **Checkout -> Payment links -> Create test payment link -> Products or subscriptions**, select your product, quantity 1. Three things matter:
 
 1. Collect the buyer's GitHub handle: **Advanced options -> Add custom fields**, add ONE field - Type **Text**, Label **GitHub username**.
 2. Wire the redirect: open the **After payment** tab, and under **Confirmation page** choose **Don't show confirmation page**, then set the redirect URL to \`https://YOUR-WORKER-URL/claim/by-txn/stripe/{CHECKOUT_SESSION_ID}\` - paste \`{CHECKOUT_SESSION_ID}\` literally, braces and all; Stripe substitutes the real checkout-session id at redirect. This lets a buyer who mistypes their handle self-correct.

@@ -11,6 +11,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions fol
 
 Nothing yet.
 
+## [3.2.2] - 2026-10-03
+
+### Changed
+
+- Dev dependencies, so that a fresh clone's first `npm install` reports no vulnerabilities: hono 4.13.12
+  (the peer range stays `^4`; the advisory concerns `hono/jsx` boundary components, which core's pages do
+  not use), the undici override 7.29.1 (the earlier pin had come to hold undici below the fix), wrangler
+  4.124.0 with `@cloudflare/vitest-pool-workers` 0.22.0, which run the test suite on miniflare 5.
+  `npm audit` is clean at every level. Nothing in the Worker bundle changes.
+- README: the "Why this exists" section no longer claims that Polar, Dodo and GitHub Sponsors are
+  Stripe-bound or lock out sellers outside Stripe's countries; what it says instead is what holds, that
+  they own the payment rail and decide their own country lists. The opening paragraph names the
+  providers Pro adds.
+- The Stripe guide and the setup wizard follow the Stripe dashboard's current layout: a Payment Link is
+  created under **Checkout, then Payment links**; the rest of the steps are unchanged.
+
 ## [3.2.1] - 2026-09-17
 
 ### Fixed

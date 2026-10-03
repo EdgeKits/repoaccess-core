@@ -9,8 +9,8 @@ import { defineConfig } from 'vitest/config'
 // `wizard-worker` project runs the one test that needs workerd WITH Node compatibility -
 // see the note on its own plugin block below. The `node` project runs the tests that need a
 // real filesystem in a plain Node environment - the setup-wizard build-script tests
-// (scripts/wizard.mjs and scripts/wizard-driver.mjs, which also need node:child_process) and
-// the public-surface guard, which reads the source text of src/lib.ts and the exported
+// (scripts/wizard.mjs and scripts/wizard-driver.mjs, which also need node:child_process),
+// and the public-surface guard, which reads the source text of src/lib.ts and the exported
 // unions. workerd provides neither module.
 export default defineConfig({
   test: {

@@ -771,11 +771,13 @@ describe('screen wording', () => {
     expect(record.type).toBe('do')
     // The button is **Create test payment link** in Test mode - maintainer-confirmed live 2026-07-16,
     // and the wizard is always in Test mode. "New" is what the dashboard used to say; a deployer who
-    // reads it hunts for a button that is not on their screen.
+    // reads it hunts for a button that is not on their screen. Payment links moved under Checkout -
+    // maintainer-confirmed live 2026-10-03; the old top-level path is guarded for the same reason.
     expect(record.text).toContain(
-      '**Payment Links -> Create test payment link -> Products or subscriptions**, select your product, quantity 1',
+      '**Checkout -> Payment links -> Create test payment link -> Products or subscriptions**, select your product, quantity 1',
     )
     expect(record.text).not.toContain('Payment Links -> New')
+    expect(record.text).not.toContain('**Payment Links ->')
     expect(record.text).toContain('Three things matter:')
     expect(record.text).toContain(
       '**Advanced options -> Add custom fields**, add ONE field - Type **Text**, Label **GitHub username**.',

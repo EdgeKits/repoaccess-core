@@ -15,18 +15,19 @@ Use it to sell SaaS boilerplates, starter kits, courses, AI notebooks, private m
 community resources. Anything delivered as a repo.
 
 `repoaccess-core` is the free, open-source (AGPL-3.0) core. It ships the **Stripe** adapter plus the
-full grant and revoke engine. **RepoAccess Pro** (see below) adds more payment providers (including
-Merchant-of-Record options) for sellers who can't use Stripe, several customizable claim-page
-templates, and support.
+full grant and revoke engine. **RepoAccess Pro** (see below) adds **Paddle**, **Lemon Squeezy**,
+**Gumroad**, **Razorpay** and **Telegram Stars** for GitHub repo access from the regions and storefronts
+Stripe doesn't reach, several customizable claim-page templates, and support.
 
 ## Why this exists
 
 Tools like Polar, Dodo, and GitHub Sponsors also solve "pay, then GitHub access", but they're **billing
 platforms**: you adopt their checkout and they take a per-transaction cut. Two consequences:
 
-- **They're Stripe-bound.** If you're somewhere Stripe isn't available (much of CIS, MENA, Africa,
-  Asia, and beyond), you're locked out.
-- **They own the rail.** You can't bring the provider you already sell with, and you pay a % forever.
+- **They own the rail.** You can't bring the provider you already sell with - not the Stripe account
+  with your history on it, not Paddle, not a local provider your buyers trust - and you pay a % forever.
+- **Their country list is their decision, not yours.** Each platform decides where it onboards sellers
+  and can close a country to new sellers at any time; when that happens, your storefront goes with it.
 
 RepoAccess is the opposite: a light, single-purpose access-grant worker you self-host and wire to
 **any** webhook-capable provider. This repository ships the engine with a complete Stripe

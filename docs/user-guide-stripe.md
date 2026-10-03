@@ -176,7 +176,7 @@ needs it. Open `/health` and confirm `{"status":"ok"}`.
 1. **Create the product** (Product catalog, then Create product - this is the current label, not the
    older "Products, then Add product"). Set a one-time price. Copy the **product id** (`prod_...`) and
    wire it into `productTeamMap` from Step 2.
-2. **Create a Payment Link** (Payment Links, then Create test payment link - the label that button
+2. **Create a Payment Link** (Checkout, then Payment links, then Create test payment link - the label that button
    carries while the dashboard is in Test mode - then Products or subscriptions; select your product,
    quantity 1). Leave the options off
    (no managed payments, tax, address collection). For **`username` mode**, under **Advanced options,
