@@ -98,7 +98,7 @@ const WELCOME = `This wizard sets up your RepoAccess worker one verified step at
 
 Two quick questions first - they set the whole run.`
 
-const ENV_NOTE = `_This choice is about your worker, not your Stripe account. Even Production runs Stripe in test mode - going live with real cards is a separate, final step._`
+const ENV_NOTE = `_This choice is about your worker, not your Stripe account. Even Production runs Stripe in a sandbox (or test mode on an older account) - going live with real cards is a separate, final step._`
 
 // The road map, and the one prerequisite that has to be stated BEFORE the run starts spending the
 // deployer's time: a second GitHub account. It is needed at 4d, which is most of an hour in, and a
@@ -306,7 +306,7 @@ const WORKER_URL_PRODUCTION = `Your worker will run on your own domain. Which cu
 
 Its zone must be on this same Cloudflare account - that's how the deploy provisions the DNS record and certificate. If the zone isn't here yet, add it to Cloudflare first.`
 
-const STRIPE_PRODUCT = `Now Stripe. Keep the dashboard in **Test mode** (toggle, top of the page) - even a Production worker uses test Stripe until you go live at the end.
+const STRIPE_PRODUCT = `Now Stripe. Work in a Stripe **sandbox** (the account switcher, top left; an older account may show a **Test mode** toggle instead, which works the same) - even a Production worker uses test Stripe until you go live at the end.
 
 Create your product: **Product catalog -> Create product**. Name it and set a one-time price.
 
@@ -317,26 +317,32 @@ Open the product and copy its **product id** (\`prod_...\`, on the product page)
 // `/claim/:token` is a different route that expects a claim TOKEN, so a session id posted at it is not
 // a slow path, it is a dead one.
 //
-// The button is **Create test payment link** in Test mode, not "New" - live-confirmed in the dashboard
-// (2026-07-16), and the wizard only ever runs Stripe in Test mode, so that is the only name a deployer
-// on this screen can see. Payment links are a tab under Checkout, not a top-level menu item
-// (live-confirmed 2026-10-03).
+// The button is **Create test payment link** in a sandbox or Test mode, not "New" - live-confirmed in
+// the dashboard (2026-07-16 in Test mode, and 2026-11-21 in a sandbox), and the wizard only ever runs
+// Stripe on test data, so that is the only name a deployer on this screen can see. Payment links are a
+// tab under Checkout, not a top-level menu item (live-confirmed 2026-10-03). The custom field is
+// required by default, so the screen has the deployer tick Mark as optional, which keeps the claim
+// page as the fallback for a buyer who leaves it empty.
 const PAYMENT_LINK = `Create a Payment Link: **Checkout -> Payment links -> Create test payment link -> Products or subscriptions**, select your product, quantity 1. Three things matter:
 
-1. Collect the buyer's GitHub handle: **Advanced options -> Add custom fields**, add ONE field - Type **Text**, Label **GitHub username**.
+1. Collect the buyer's GitHub handle: **Advanced options -> Add custom fields**, add ONE field - Type **Text**, Label **GitHub username** - and tick **Mark as optional**, because Stripe makes the field required by default and a buyer who leaves it empty is sent to the claim page instead.
 2. Wire the redirect: open the **After payment** tab, and under **Confirmation page** choose **Don't show confirmation page**, then set the redirect URL to \`https://YOUR-WORKER-URL/claim/by-txn/stripe/{CHECKOUT_SESSION_ID}\` - paste \`{CHECKOUT_SESSION_ID}\` literally, braces and all; Stripe substitutes the real checkout-session id at redirect. This lets a buyer who mistypes their handle self-correct.
 3. Tell the worker which product this is: after the link is created, open its **detail page**, scroll to **Metadata**, click **Edit metadata**, and add key \`product_id\` = \`PRODUCT-ID\` (the same \`prod_...\` from the last step). Stripe's checkout webhook omits line items, so the worker reads the product from this metadata - without it the sale maps to no team and grants nothing.
 
 Type **done** when the link is created and the metadata is set.`
 
-// The order here is the order Stripe's current Event destinations flow really asks for: the events come
-// FIRST, then the endpoint URL. Naming them the other way round leaves the deployer hunting for a URL
-// field that is not on screen yet.
+// The order here is the order Stripe's current Event destinations flow really asks for, in three steps:
+// the payload style (Snapshot, preselected) and API version, then the events, on the first; the
+// destination type (Webhook endpoint) on the second; the endpoint URL on the third. The payload style
+// comes before the events because changing it clears any events already selected. Naming the steps in
+// another order leaves the deployer hunting for a field that is not on screen yet.
 const webhookSecret = (
   env,
-) => `Create the webhook: **Developers -> Webhooks (Event destinations) -> Add destination**. Stripe's current flow selects the EVENTS FIRST, then the endpoint:
+) => `Create the webhook: **Developers -> Webhooks (Event destinations) -> Add destination**. Stripe's current flow takes the payload style and the EVENTS FIRST, then the destination type, then the endpoint:
 
+- **Payload style:** **Snapshot** (preselected), and leave the **API version** at its default. Set these before the events: changing the payload style clears the events already selected.
 - Events - send exactly these four: \`checkout.session.completed\`, \`checkout.session.async_payment_succeeded\`, \`charge.refunded\`, \`charge.dispute.created\`.
+- **Destination type:** **Webhook endpoint**.
 - **Configure destination -> Endpoint URL:** \`https://YOUR-WORKER-URL/wh/stripe/YOUR-SECRET-PATH\` _(I generated the path - obscurity only, the worker doesn't validate it)_.
 
 Create it, then reveal the **Signing secret** (\`whsec_...\`) with the eye icon and copy it. Open **\`${secretsFileFor(env)}\`** and paste it on its own line, no spaces around the \`=\`:
@@ -608,7 +614,7 @@ const closingFullSandbox = (
 ) => `Done - your sandbox worker is proven end to end: purchase -> invite -> ${REFUND_CLAUSE[revokePolicy] ?? REFUND_CLAUSE.auto_revoke}. (${CLAIM_PATH_CLAUSE[claimPath]})
 
 **What you have:** a working worker on \`workers.dev\`, the core money flow verified.
-**What you don't have yet:** this is not a selling setup. The worker is on a \`workers.dev\` subdomain and Stripe is in test mode - nothing here can take a real payment.
+**What you don't have yet:** this is not a selling setup. The worker is on a \`workers.dev\` subdomain and Stripe is in a sandbox (or test mode) - nothing here can take a real payment.
 
 **To sell for real:**
 1. Run this wizard again and choose **Production** - that puts the worker on your own domain.
@@ -618,7 +624,7 @@ ${closingReminders(repoAttached)}`
 
 const CLOSING_FULL_PRODUCTION = `Done - your production worker is live on \`YOUR-DOMAIN\` and proven end to end.
 
-**One thing stands between you and selling: Stripe is still in test mode.** To take real money:
+**One thing stands between you and selling: Stripe is still in a sandbox (or test mode).** To take real money:
 - Rebuild the product, Payment Link, and webhook in your **live** Stripe dashboard.
 - Put the **live product id** in \`productTeamMap\` and the **live signing secret** in \`STRIPE_WEBHOOK_SECRET\` (\`.dev.vars.production\`).
 - Deploy again, then prove it with one real-card purchase and a refund. Stripe keeps the processing fee on a refund - a few cents, and the cheapest certainty you'll buy.
@@ -1812,7 +1818,7 @@ const RECOVERY = {
   'stripe-product': [
     {
       when: 'the dashboard is in live mode',
-      text: 'Check the **Test mode** toggle at the top of the Stripe dashboard. A product created in live mode has a different id and will not match what this run wires. Switch to Test mode and create it there.',
+      text: 'Check that you are in your Stripe **sandbox** (the account switcher, top left; on an older account, the **Test mode** toggle). A product created in live mode has a different id and will not match what this run wires. Switch to the sandbox and create it there.',
     },
     {
       when: "that doesn't look like a product id",
@@ -1941,7 +1947,7 @@ const RECOVERY = {
   purchase: [
     {
       when: 'the card was declined',
-      text: "Use Stripe's test card `4242 4242 4242 4242`, any future expiry, any CVC. A real card declines in test mode. Where Stripe asks for a name, address or ZIP, anything valid works.",
+      text: "Use Stripe's test card `4242 4242 4242 4242`, any future expiry, any CVC. A real card declines in a sandbox or test mode. Where Stripe asks for a name, address or ZIP, anything valid works.",
     },
     {
       when: 'there is no github field at checkout',
@@ -2000,7 +2006,7 @@ const RECOVERY = {
     },
     {
       when: 'the card was declined',
-      text: "Use Stripe's test card `4242 4242 4242 4242`, any future expiry, any CVC. A real card declines in test mode. Where Stripe asks for a name, address or ZIP, anything valid works.",
+      text: "Use Stripe's test card `4242 4242 4242 4242`, any future expiry, any CVC. A real card declines in a sandbox or test mode. Where Stripe asks for a name, address or ZIP, anything valid works.",
     },
   ],
   'typo-claim': [

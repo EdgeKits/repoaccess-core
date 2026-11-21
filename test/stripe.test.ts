@@ -230,6 +230,36 @@ describe('stripe adapter - delayed payment methods (via the route)', () => {
   })
 })
 
+describe('stripe adapter - a subscription checkout grants nothing in core (via the route)', () => {
+  // Core sells one-time access. A Checkout Session for a recurring price carries no payment_intent, so
+  // there is no transaction to grant against, whether it is paid at checkout or opens a free trial.
+  async function deliver(body: string) {
+    const env = mockEnv({ STRIPE_WEBHOOK_SECRET: SECRET })
+    const app = createWorker({ adapters: [stripe], config: mockConfig() })
+    const res = await app.request(
+      '/wh/stripe/whpath',
+      await signedRequest(body),
+      env,
+    )
+    const calls = (env.ACCESS_WORKFLOW.createBatch as ReturnType<typeof vi.fn>)
+      .mock.calls
+    return { res, calls }
+  }
+
+  it('subscription paid at checkout → parse null, 400, no Workflow instance', async () => {
+    expect(stripe.parse(raw(fx.sessionSubscriptionPaid.raw))).toBeNull()
+    const { res, calls } = await deliver(fx.sessionSubscriptionPaid.raw)
+    expect(res.status).toBe(400)
+    expect(calls).toHaveLength(0)
+  })
+
+  it('subscription with a free trial (no_payment_required) → 200, no Workflow instance', async () => {
+    const { res, calls } = await deliver(fx.sessionSubscriptionTrial.raw)
+    expect(res.status).toBe(200)
+    expect(calls).toHaveLength(0)
+  })
+})
+
 describe('stripe adapter - parse()', () => {
   it('checkout.session.completed (paid) → payment_success with payment_intent + metadata username', () => {
     const event = stripe.parse(raw(sessionPaid))

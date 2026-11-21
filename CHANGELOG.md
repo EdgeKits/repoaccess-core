@@ -11,6 +11,49 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions fol
 
 Nothing yet.
 
+## [3.3.0] - 2026-11-21
+
+### Added
+
+- A refund or chargeback whose revoke cannot finish now tells you. If GitHub keeps failing through every
+  retry (about three hours of backoff), or anything else breaks mid-revoke, the worker sends
+  `access.failed` with the new reason `revoke_error`, and the Workflow instance still ends Errored. Before,
+  only the Errored instance and a log line recorded it, while the buyer could still hold the team. The
+  event carries the buyer's username and teams when the worker had already read the purchase, and the
+  setup guide's troubleshooting list says how to finish the revoke by hand. If your event endpoint
+  switches on `reason`, add the new value.
+- The Stripe guides document **Stripe Managed Payments**, with Stripe as your merchant of record. The worker
+  needs no change for it: a grant, a refund and a chargeback have each been tested end to end with it
+  switched on, and the GitHub username field works on its checkout.
+- A new event type for adapters, `access_ended`: the access itself ran out (a subscription ended, a term
+  expired), as opposed to money going back. The worker revokes on it whatever the product's `revoke_policy`
+  says, since that policy governs refunds, and the `access.revoked` it sends carries `trigger: 'access_ended'`.
+  Core's Stripe adapter never emits it; it is there for adapters that sell subscriptions or time-limited
+  access. If you switch on `NormalizedEvent.event_type` or on an event's `trigger`, add the new value.
+
+### Changed
+
+- The Stripe guide, its manual walkthrough and the setup wizard follow the Stripe dashboard as it is now.
+  You test in a **sandbox** (an older account's Test mode works the same); the Payment Link's GitHub
+  username field is required by default, so the guides say to tick **Mark as optional**; and a webhook
+  destination takes its payload style and API version before the events, then a destination type, then
+  the URL.
+- The `.dev.vars` templates say which Stripe signing secret goes where: the sandbox one while you test, the
+  live one once you go live.
+- Dev dependencies: `@cloudflare/vitest-pool-workers` 0.23.0, vitest 4.1.12, prettier 3.10.1 and hono
+  4.13.19 (dev pin; the peer range stays `^4`), with the undici override at 7.30.2, sharp at 0.35.5 and a
+  new zod override at 4.6.7, so a fresh clone's `npm install` stays clean. wrangler stays at 4.124.0, the
+  version the test pool pins.
+- README and setup guide: Lemon Squeezy is winding down (it stops processing payments on 31 March 2027),
+  so RepoAccess Pro's provider list now names Creem in its place.
+- README and guides say plainly that core sells one-time access: a checkout for a recurring (subscription)
+  price grants nothing in core. Subscriptions are a RepoAccess Pro feature.
+- An event whose type the engine does not know now does nothing: it logs an error and its Workflow instance
+  ends as Errored. Before, anything that was not a payment was handled as a revoke, so a bad value from a
+  custom adapter or an RPC caller could remove a buyer.
+- The README opens with "RepoAccess by EdgeKits" and the product page's address, and a new section near the top,
+  "Free or Pro: which one you need", says which edition fits how you sell.
+
 ## [3.2.2] - 2026-10-03
 
 ### Changed

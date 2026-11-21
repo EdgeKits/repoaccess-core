@@ -19,7 +19,9 @@ to the GitHub team that carries your private repo. A refund or chargeback revoke
 as a single Cloudflare Worker on your own account - no server, no SaaS subscription, no per-sale cut.
 Cloudflare's free plan carries hundreds of sales a day.
 
-Do a first run in **Stripe Test mode** with test cards. No live activation is needed to prove it works.
+Do a first run in a **Stripe sandbox** with test cards (the account switcher, top left; an older account
+may show a **Test mode** toggle instead, and that works the same). No live activation is needed to prove
+it works.
 
 ## Before you start
 
@@ -174,14 +176,17 @@ needs it. Open `/health` and confirm `{"status":"ok"}`.
 ## 4. Stripe: product, link, metadata, webhook
 
 1. **Create the product** (Product catalog, then Create product - this is the current label, not the
-   older "Products, then Add product"). Set a one-time price. Copy the **product id** (`prod_...`) and
-   wire it into `productTeamMap` from Step 2.
-2. **Create a Payment Link** (Checkout, then Payment links, then Create test payment link - the label that button
-   carries while the dashboard is in Test mode - then Products or subscriptions; select your product,
-   quantity 1). Leave the options off
-   (no managed payments, tax, address collection). For **`username` mode**, under **Advanced options,
-   then Add custom fields**, add ONE field - Type **Text**, Label **GitHub username** (Stripe derives
-   the field key from the label, and the worker matches a key that contains "github"); for **`claim`
+   older "Products, then Add product"). Set a one-time price (a recurring price grants nothing in core;
+   subscriptions are a RepoAccess Pro feature). Copy the **product id** (`prod_...`) and wire it into
+   `productTeamMap` from Step 2.
+2. **Create a Payment Link** (Checkout, then Payment links, then Create test payment link - the label that
+   button carries in a sandbox or test mode - then Products or subscriptions; select your product,
+   quantity 1). Leave the options off (tax, address collection). **Enable Managed Payments** is the one
+   option you may want; it is optional and covered in "Stripe as merchant of record" below. For
+   **`username` mode**, under **Advanced options, then Add custom fields**, add ONE field - Type
+   **Text**, Label **GitHub username** (Stripe derives the field key from the label, and the worker
+   matches a key that contains "github") - and tick **Mark as optional**, because the field is required
+   by default and an empty handle is not a dead end: it falls back to the claim page. For **`claim`
    mode**, add no field. Copy the link URL.
 
    In `username` mode the field lives on Stripe's checkout, so it is the last thing you control before
@@ -196,7 +201,9 @@ needs it. Open `/health` and confirm `{"status":"ok"}`.
    metadata; add key `product_id`, value `prod_...`). This is the step people miss: the
    `checkout.session.completed` webhook omits line items, so the worker reads the product from metadata.
 4. **Create the webhook destination** (Developers, then Webhooks (Event destinations), then Add
-   destination). The current flow takes the **events first**, then the destination URL:
+   destination). The current flow takes the **events first**, then the destination type, then the URL:
+   - **Payload style:** **Snapshot** (preselected), and leave the **API version** at its default. Set
+     these before the events: changing the payload style clears the events already selected.
    - **Events (select these four):** `checkout.session.completed`,
      `checkout.session.async_payment_succeeded`, `charge.refunded`, `charge.dispute.created`. The
      fourth is for delayed payment methods such as bank debits and vouchers: Stripe completes the
@@ -204,8 +211,7 @@ needs it. Open `/health` and confirm `{"status":"ok"}`.
      that grants those buyers once it does. If your webhook endpoint already exists with only the other
      three, add `checkout.session.async_payment_succeeded` to it in the Stripe dashboard, or buyers who
      pay with a delayed method are never granted.
-   - **Payload style:** pick **Snapshot** if the option appears; the current flow may not show it (it
-     defaults to the full snapshot payload).
+   - **Destination type:** **Webhook endpoint**.
    - **Endpoint URL:** `https://<your-worker>.workers.dev/wh/stripe/<SECRET_PATH>`, where `<SECRET_PATH>`
      is a random hard-to-guess string you generate:
 
@@ -217,6 +223,31 @@ needs it. Open `/health` and confirm `{"status":"ok"}`.
      is NOT a worker secret. Keep it in your notes.
 
    - Reveal the **Signing secret** (`whsec_...`) for the next step.
+
+### Stripe as merchant of record (Managed Payments)
+
+Stripe's **Managed Payments** makes Stripe the merchant of record for your sales: it calculates, collects
+and remits sales tax and VAT, handles fraud and disputes, and supports your buyers, for an extra fee per
+transaction (the dashboard shows the current rate). The worker needs no change for it. The purchase,
+refund and dispute events arrive exactly as in step 4, the GitHub username field works on its checkout,
+and a grant, a refund and a chargeback have each been tested end to end with it switched on.
+
+It is optional, and only available if your business is based in a country Stripe supports for it: check
+Stripe's Managed Payments eligibility page first. To switch it on:
+
+1. In the dashboard, open **Payments, then Managed Payments, then Get started**. Pick the category that
+   describes what you sell (for code delivered as a repository, **Downloadable Software - business use**
+   is the usual one), then give your product an eligible category when the setup lists it.
+2. On your Payment Link, tick **Enable Managed Payments**. Stripe then switches on tax collection for the
+   link itself. Everything else from step 4 stays as it is: the custom field, the redirect, the metadata
+   and the webhook.
+
+What changes is what your buyer sees. The checkout runs through Link and is marked as sold through Link,
+tax for the buyer's location is added at checkout, and the price may be offered in their currency.
+
+One path could not be tested: Stripe says it can refund a purchase itself, within 60 days, to head off a
+chargeback, and a sandbox offers no way to trigger that. If you use Managed Payments, check your worker's
+log when Stripe reports such a refund, and remove the buyer by hand if no `access.revoked` follows.
 
 ## 5. Add the secret and re-deploy
 
@@ -343,7 +374,8 @@ If you took the guided path, read this first, because the two words look alike a
 The wizard asks whether you are setting up **sandbox** or **production**. That choice is about **your
 worker**: the config profile, `.dev.vars.production`, and a custom domain instead of `*.workers.dev`. It
 is not about Stripe. **Neither environment puts Stripe into live mode.** Whenever the wizard buys
-anything it is the test card `4242 4242 4242 4242`, and the dashboard has to be in test mode, because a
+anything it is the test card `4242 4242 4242 4242`, and the dashboard has to be in a sandbox (or test
+mode), because a
 test card is refused in live mode.
 
 So after a successful "production" wizard run you have a production **worker**, on your own domain,
@@ -353,14 +385,14 @@ prove a setup is a decision you make deliberately, not one a script walks you in
 
 ### Going live: two values, then a deploy
 
-Stripe keeps test and live data apart, so nothing you built in test mode exists in live mode. **The
+Stripe keeps test and live data apart, so nothing you built in a sandbox exists in live mode. **The
 steps are the ones you already did**, and you already know how to do them - only now in the live
 dashboard: create the product, create the Payment Link (with the same GitHub-handle field and the same
 redirect), and add the webhook endpoint (same worker URL, same four events -
 `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `charge.refunded`,
 `charge.dispute.created`).
 
-The labels are not necessarily the ones section 4 names, because those are the Test-mode ones. The three
+The labels are not necessarily the ones section 4 names, because those are the sandbox ones. The three
 actions are the same three, in the same order.
 
 Two of the things you create there have a copy inside your worker, and they are the only two:

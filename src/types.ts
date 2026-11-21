@@ -42,6 +42,7 @@ export interface JsonObject {
  */
 export type GrantMode = 'username' | 'claim'
 
+/** What a refund or chargeback does to access. An `access_ended` event revokes whatever this says. */
 export interface RevokePolicy {
   mode: 'auto_revoke' | 'log_only'
   /** Gates `refund` events only; chargebacks always revoke under auto_revoke. */
@@ -174,7 +175,13 @@ export interface RepoAccessConfig {
 }
 
 export interface NormalizedEvent {
-  event_type: 'payment_success' | 'refund' | 'chargeback'
+  /**
+   * `access_ended` means the access itself ran out (a subscription ended, a term expired), not money
+   * going back: it always revokes, whatever the product's `revoke_policy` says. Do not reuse the
+   * transaction id after it: once a grant for that id was committed, every later grant for it is
+   * refused, so an adapter must give each entitlement period its own id.
+   */
+  event_type: 'payment_success' | 'refund' | 'chargeback' | 'access_ended'
   product_id: string
   /** Stable correlation key - identical across an order and its later refund/chargeback. */
   transaction_id: string

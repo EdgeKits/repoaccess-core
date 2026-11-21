@@ -1,7 +1,9 @@
-# RepoAccess
+# RepoAccess by EdgeKits
 
 **Sell access to a private GitHub repo on your own infrastructure, with the payment provider you
 already use.**
+
+Website: [edgekits.dev/en/tools/repoaccess](https://edgekits.dev/en/tools/repoaccess/)
 
 A buyer pays, and they're automatically invited to the GitHub team that carries access to your private
 repo. A refund or chargeback revokes it. It runs as a single **Cloudflare Worker** on your own
@@ -14,10 +16,26 @@ committed in this repo, so you can check them before you start.
 Use it to sell SaaS boilerplates, starter kits, courses, AI notebooks, private modules, or paid
 community resources. Anything delivered as a repo.
 
-`repoaccess-core` is the free, open-source (AGPL-3.0) core. It ships the **Stripe** adapter plus the
-full grant and revoke engine. **RepoAccess Pro** (see below) adds **Paddle**, **Lemon Squeezy**,
-**Gumroad**, **Razorpay** and **Telegram Stars** for GitHub repo access from the regions and storefronts
-Stripe doesn't reach, several customizable claim-page templates, and support.
+`repoaccess-core` is the free, open-source (AGPL-3.0) core. It ships the **Stripe** adapter for one-time
+payments, which also works with Stripe Managed Payments (Stripe as your merchant of record, handling sales
+tax and VAT), plus the full grant and revoke engine. **RepoAccess Pro** (see below) adds **subscriptions**
+(access that lasts as long as the buyer keeps paying), **Paddle**, **Creem**, **Gumroad**, **Razorpay** and
+**Telegram Stars** for GitHub repo access from the regions and storefronts Stripe doesn't reach, several
+customizable claim-page templates, and support.
+
+## Free or Pro: which one you need
+
+The free core is enough if you sell through Stripe, Stripe Managed Payments included: it ships the Stripe
+adapter, team invites, and removal on refunds and chargebacks, under AGPL-3.0.
+
+You need **RepoAccess Pro** if you sell through Paddle, Creem or Gumroad (merchants of record that handle
+your sales tax), through Razorpay or with Telegram Stars, if you sell access on a subscription, or if the
+AGPL does not fit your use (see [License](#license)). Pro is $19 once and includes twelve months of updates
+and support; renewing after that is optional, $9 a year.
+
+Moving off Lemonrepo or Lemon Squeezy? Lemon Squeezy stops processing payments on 31 March 2027. You
+already sell through a merchant of record, so Pro's Paddle or Creem adapter is the like-for-like
+replacement; if your business can use Stripe Managed Payments, the free core covers you too.
 
 ## Why this exists
 
@@ -208,9 +226,11 @@ a version fixes, whether it touches config you set, and whether it is worth taki
 
 ## RepoAccess Pro
 
-Core is everything you need to self-host with Stripe. **Pro** is for sellers who need more:
+Core is everything you need to self-host one-time sales with Stripe. **Pro** is for sellers who need more:
 
-- **More payment providers**: **Paddle** and **Lemon Squeezy** (Merchant-of-Record, with tax handled
+- **Subscriptions**: sell access on a recurring plan. The buyer joins the team when the subscription starts
+  and leaves it when the subscription ends, with the providers that offer subscriptions.
+- **More payment providers**: **Paddle** and **Creem** (Merchant-of-Record, with tax handled
   for you), **Gumroad**, **Razorpay** (India), and **Telegram Stars** (in-Telegram checkout). Sell from
   the regions, and with the providers, a Stripe-only setup can't reach. More providers are on the way.
 - **Your brand on every page the buyer sees.** The claim form, the "setting up your access" page, "access

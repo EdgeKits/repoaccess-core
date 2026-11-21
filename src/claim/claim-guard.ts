@@ -95,9 +95,13 @@ export type AcquireResult =
 export type GuardStatus =
   'idle' | 'processing' | 'granted' | 'closed' | 'revoked'
 
-/** What a refund or dispute event said, with no judgement about what it should do. */
+/**
+ * What a refund, dispute or ended-access event said, with no judgement about what it should do. The
+ * type keeps its name (and the storage key `refunds`), but an `access_ended` is recorded as itself,
+ * never as a refund.
+ */
 export interface RefundFacts {
-  event_type: 'refund' | 'chargeback'
+  event_type: 'refund' | 'chargeback' | 'access_ended'
   is_full_refund: boolean | null
 }
 

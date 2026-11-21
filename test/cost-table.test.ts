@@ -52,7 +52,7 @@ import type {
 const ROW_LABELS = {
   username: 'Sale in `username` mode (the handle arrived with the payment)',
   claim: 'Sale in `claim` mode (the buyer enters their handle)',
-  revoke: 'Refund or chargeback, access revoked',
+  revoke: 'Refund, chargeback or ended access, access revoked',
 } as const
 
 interface PublishedRow {
@@ -257,6 +257,16 @@ const refund = (txn: string): NormalizedEvent => ({
   is_full_refund: true,
 })
 
+/** An ended access (a subscription ended, a term expired) is shaped like a refund for the engine. */
+const accessEnded = (txn: string): NormalizedEvent => ({
+  event_type: 'access_ended',
+  product_id: '',
+  transaction_id: txn,
+  buyer_email: null,
+  github_username: null,
+  is_full_refund: null,
+})
+
 /**
  * EVERY JOURNEY GETS ITS OWN BUYER, AND THAT IS NOT TIDINESS.
  *
@@ -404,4 +414,59 @@ describe('the published cost table matches a measured run', () => {
       `${mismatch('revoke', 'KV deletes', published.deletes)}\ndeletes: ${m.deletes.join(', ')}`,
     ).toBe(published.deletes)
   })
+
+  // The revoke row also names an ended access, and that claim is only true while an `access_ended`
+  // revoke spends exactly what a refund's does. Each case measures both journeys, on separate buyers,
+  // and holds the ended one to the refund's step labels (with the transaction id masked) as well as to
+  // the published cells, so a step that only one of them takes cannot hide behind an equal count.
+  for (const pendingInvite of [true, false]) {
+    const state = pendingInvite ? 'pending' : 'accepted'
+    it(`an ended access costs exactly what a refund does (invitation ${state})`, async () => {
+      const published = publishedRow(ROW_LABELS.revoke)
+      const range = revokeSteps()
+      const expectedSteps = pendingInvite ? range.pending : range.accepted
+      const journey = async (
+        txn: string,
+        login: string,
+        revoke: NormalizedEvent,
+      ) => {
+        fakeGithub(pendingInvite, login)
+        await run(meter(), { adapter: 'stripe', event: sale(txn, login) })
+        const m = meter()
+        await run(m, { adapter: 'stripe', event: revoke })
+        vi.restoreAllMocks()
+        return m
+      }
+      const masked = (m: Meter, txn: string, login: string) =>
+        m.steps.map((s) => s.split(txn).join('TXN').split(login).join('LOGIN'))
+
+      const r = await journey(
+        `pi_r_${state}`,
+        `buyer-r-${state}`,
+        refund(`pi_r_${state}`),
+      )
+      const e = await journey(
+        `pi_e_${state}`,
+        `buyer-e-${state}`,
+        accessEnded(`pi_e_${state}`),
+      )
+
+      expect(
+        masked(e, `pi_e_${state}`, `buyer-e-${state}`),
+        'an access_ended revoke ran different steps from a refund revoke',
+      ).toEqual(masked(r, `pi_r_${state}`, `buyer-r-${state}`))
+      expect(
+        e.steps.length,
+        `${mismatch('revoke', `Workflow steps (ended access, invitation ${state})`, expectedSteps)}\nsteps: ${e.steps.join(', ')}`,
+      ).toBe(expectedSteps)
+      expect(
+        e.writes.length,
+        `${mismatch('revoke', 'KV writes (ended access)', published.writes)}\nwrites: ${e.writes.join(', ')}`,
+      ).toBe(published.writes)
+      expect(
+        e.deletes.length,
+        `${mismatch('revoke', 'KV deletes (ended access)', published.deletes)}\ndeletes: ${e.deletes.join(', ')}`,
+      ).toBe(published.deletes)
+    })
+  }
 })

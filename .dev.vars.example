@@ -10,7 +10,8 @@
 GITHUB_TOKEN=__REPLACE_ME__
 
 # Stripe webhook signing secret (whsec_…) from THIS env's Stripe webhook.
-# In this sandbox/test file: the TEST-mode secret. (In .dev.vars.production.example: the LIVE secret.)
+# In this sandbox/test file: the secret from your Stripe sandbox (or Test mode, on an older account).
+# (In .dev.vars.production.example: the sandbox one while you test, the live one once you go live.)
 STRIPE_WEBHOOK_SECRET=__REPLACE_ME__
 
 # Webhook URL path segment for /wh/stripe/<this>. NOT a worker secret (HMAC sig is the gate); it only

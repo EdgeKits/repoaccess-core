@@ -14,6 +14,11 @@ import { isValidGithubUsername } from '../username'
  * What the seller's policy says a refund/dispute should do. Shared by every place that judges one -
  * both revoke paths, a grant at entry, and the guard's atomic commit - so they can never drift on what
  * a refund means. The caller logs its own reason; this decides.
+ *
+ * An `access_ended` is not a refund and the policy does not govern it: the access ran out, so it
+ * revokes under every policy, `log_only` and `full_refund_only` included. Deciding that HERE is what
+ * makes every judge agree, the grant's entry and commit checks among them, so a later grant for the
+ * same transaction is refused exactly as after a refund that revokes.
  */
 export type RevokeGate = 'revoke' | 'log_only' | 'partial_refund'
 
@@ -21,6 +26,7 @@ export function revokeGate(
   policy: RevokePolicy,
   event: Pick<NormalizedEvent, 'event_type' | 'is_full_refund'>,
 ): RevokeGate {
+  if (event.event_type === 'access_ended') return 'revoke'
   if (policy.mode !== 'auto_revoke') return 'log_only'
   // A partial refund skips ONLY under `full_refund_only` - plain `auto_revoke` revokes it like any
   // other refund. A chargeback carries `is_full_refund: null` and always revokes, whatever the flag

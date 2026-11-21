@@ -66,7 +66,11 @@ import {
 
 const KV_MIN_TTL_SEC = 60 // Cloudflare KV floor for expirationTtl
 
-const MAX_GH_ATTEMPTS = 8 // rate-limit / 5xx backoff cap; durable sleeps span >1 day before giving up
+// Rate-limit / 5xx retry cap: the first call plus up to 8 retries, each retry after a durable sleep.
+// Without a Retry-After, `backoffMs` sleeps 1 min doubling to a 1 h cap - 1, 2, 4, 8, 16, 32, 60 and
+// 60 min - so ghStep gives up after 183 min (about 3 h) of sleeping. A Retry-After from GitHub
+// replaces the computed sleep for that retry and is not capped, so it can lengthen the total.
+const MAX_GH_ATTEMPTS = 8
 
 // Safety cap on the revoke invitation-listing pagination: 20 pages * 100/page = 2000 pending
 // invitations scanned before we stop. A refund must revoke access at volume (an org with >100 pending
@@ -104,6 +108,8 @@ const FETCH_ENTITY_RETRY = {
  *   - unhandled_event      the fetched entity parsed to null (an event kind we don't act on)
  *   - unverifiable_adapter the enqueued api_callback adapter wasn't passed to createAccessWorkflow
  *   - grant_error          a grant died on an exhausted-retry / unexpected throw (terminal catch)
+ *   - revoke_error         a revoke died on an exhausted retry or an unexpected throw (terminal
+ *                          catch), so access may NOT have been withdrawn and the seller must check
  *   - github_token_degraded  a revoke hit 401/403 - the worker's token can no longer manage members,
  *                            so access was NOT withdrawn and the seller must act (see runRevoke)
  */
@@ -115,9 +121,10 @@ export type AccessFailedReason =
   | 'unhandled_event'
   | 'unverifiable_adapter'
   | 'grant_error'
+  | 'revoke_error'
   | 'github_token_degraded'
-  // A payment_success (or claim completion) arrived for a transaction already refunded/disputed.
-  // Nothing was granted and no claim was minted - emitted so the seller sees the refusal rather
+  // A payment_success (or claim completion) arrived for a transaction already refunded, disputed or
+  // ended. Nothing was granted and no claim was minted - emitted so the seller sees the refusal rather
   // than silence, which is what let a refunded claim stay redeemable in the first place.
   | 'transaction_revoked'
 
@@ -399,7 +406,7 @@ async function runGrant(
       teams,
       username,
       'transaction_revoked',
-      'refund/dispute preceded this grant',
+      'a refund, dispute or ended access preceded this grant',
       { trigger: atEntry.trigger, sequence },
     )
     await clearSubmittedMarker(step, env, adapter, event.transaction_id)
@@ -795,7 +802,8 @@ async function fail(
   username: string | null,
   reason: AccessFailedReason,
   detail?: string,
-  // For a `transaction_revoked` refusal only: what the guard knows about the refund behind it.
+  // For a `transaction_revoked` refusal only: what the guard knows about the refund, dispute or ended
+  // access behind it.
   revocation: Revocation = {},
 ): Promise<void> {
   const { trigger, sequence } = revocation
@@ -930,10 +938,16 @@ function asSequence(value: unknown): number | undefined {
   return typeof value === 'number' && value > 0 ? value : undefined
 }
 
-/** The facts a refund or dispute event states - never what a policy makes of them. */
+/**
+ * The facts a refund, dispute or ended-access event states - never what a policy makes of them. A
+ * chargeback and an ended access are recorded as themselves; only a refund is a refund.
+ */
 function refundFacts(event: NormalizedEvent): RefundFacts {
   return {
-    event_type: event.event_type === 'chargeback' ? 'chargeback' : 'refund',
+    event_type:
+      event.event_type === 'chargeback' || event.event_type === 'access_ended'
+        ? event.event_type
+        : 'refund',
     is_full_refund: event.is_full_refund,
   }
 }
@@ -959,8 +973,8 @@ async function guardSnapshot(
 }
 
 /**
- * What a refusal knows about the refund or dispute behind it: which of the two it was, and the guard's
- * sequence for the transition into `revoked`. Each is omitted when unknown, never guessed.
+ * What a refusal knows about the event behind it: which it was (refund, dispute or ended access), and
+ * the guard's sequence for the transition into `revoked`. Each is omitted when unknown, never guessed.
  */
 type Revocation = {
   trigger?: RefundFacts['event_type']
@@ -1110,7 +1124,7 @@ async function abandonRevokedGrant(
     teams,
     username,
     'transaction_revoked',
-    'refund/dispute landed while the grant was in flight',
+    'a refund, dispute or ended access landed while the grant was in flight',
     revocation,
   )
   if (grantedTeams.length > 0) {
@@ -1429,6 +1443,7 @@ async function runRevoke(
   event: NormalizedEvent,
   map: ProductTeamMap,
   sink: EventSink,
+  progress: RevokeProgress,
 ): Promise<void> {
   // WRITE TO THE GUARD FIRST, AND DECIDE FROM WHAT THE WRITE RETURNS. The refund's facts go onto the
   // guard in the same call that reads back whether a grant has been committed. The guard is strongly
@@ -1486,10 +1501,14 @@ async function runRevoke(
     if (!committedMeanwhile) return
     log(
       'info',
-      'revoke: a grant committed while the refund was running, judging the refund by what it sold',
+      'revoke: a grant committed while the revoke was running, judging the revoke by what it sold',
       { transaction_id: event.transaction_id },
     )
     record = committedMeanwhile
+  }
+  progress.holder = {
+    github_username: record.github_username,
+    teams: record.teams ?? [],
   }
 
   const config = resolveProductConfig(map, adapter, record.product_id)
@@ -1538,7 +1557,8 @@ async function runRevoke(
  * Shared by the revoke path and by a grant that finds the transaction revoked while it was in flight -
  * at its commit, after the last write, or inside a write attempt that then made no call at all - so the
  * paths can never drift on what withdrawing access means.
- * `trigger` is the refund or dispute behind it, omitted from the envelopes when it is not known.
+ * `trigger` is the refund, dispute or ended access behind it, omitted from the envelopes when it is not
+ * known.
  * `sequence` is the guard's number for the transition into `revoked`, carried on `access.revoked`.
  */
 async function withdrawAccess(
@@ -1693,10 +1713,29 @@ function degradedTokenAbort(
       reason: 'github_token_degraded',
       ...triggerField,
     })
-    throw new NonRetryableError(
+    const err = new NonRetryableError(
       `revoke aborted: GitHub answered ${status} on ${phase} - the worker's token can no longer manage org members, so access was NOT withdrawn`,
     )
+    failureAlreadyReported.add(err)
+    throw err
   }
+}
+
+/**
+ * Errors whose `access.failed` has already been emitted by the code that threw them, so the terminal
+ * catch must not emit a second one for the same instance. Only the degraded-token abort registers
+ * here. Keyed by the error object itself: the abort throws outside any step, so the object that
+ * reaches the catch is the one registered.
+ */
+const failureAlreadyReported = new WeakSet<object>()
+
+/**
+ * What a revoke has learned by the time it throws, for the `access.failed` the terminal catch emits.
+ * `holder` is set once the grant record (or the guard's copy of it) has been resolved, and stays null
+ * before that: the refund event's own `github_username` is typically null and is not who holds access.
+ */
+interface RevokeProgress {
+  holder: { github_username: string; teams: string[] } | null
 }
 
 /**
@@ -1900,7 +1939,7 @@ async function settleUncommittedGrant(
 
   log(
     'warn',
-    'grant ended without committing: withdrawing teams a refund kept on its account',
+    'grant ended without committing: withdrawing teams a revoke kept on its account',
     { transaction_id: txn, teams: owed },
   )
   await removeMemberships(step, env, org, map, event, username, {
@@ -2049,9 +2088,24 @@ async function emitApiCallbackFailure(
 
 // --- entrypoint -------------------------------------------------------------
 
+const KNOWN_EVENT_TYPES: readonly NormalizedEvent['event_type'][] = [
+  'payment_success',
+  'refund',
+  'chargeback',
+  'access_ended',
+]
+
+function isKnownEventType(
+  value: unknown,
+): value is NormalizedEvent['event_type'] {
+  return (KNOWN_EVENT_TYPES as readonly unknown[]).includes(value)
+}
+
 /**
- * Grant vs revoke decided by `event.event_type`. Reconciliation-based: every step reads
- * current GitHub state and converges, so duplicate/retried runs are no-ops. `appConfig` carries the
+ * Grant vs revoke decided by `event.event_type`; a type outside the four known ones does nothing and
+ * ends the instance Errored.
+ * Reconciliation-based: every step reads current GitHub state and converges, so duplicate/retried
+ * runs are no-ops. `appConfig` carries the
  * deployment config (org + product map) - no longer read from env vars. `sink` is
  * injectable for tests; production uses the signed-HTTP delivery sink (`createEventSink`).
  *
@@ -2133,7 +2187,29 @@ export async function executeAccessWorkflow(
     return
   }
 
+  // An event type this worker does not know does NOTHING: no grant, no revoke, no event sent. Every
+  // branch below reads `event_type`, and a revoke is the costly default to fall into, because it
+  // removes a paying buyer. The check runs on the value as it arrived, not on its declared type, so
+  // it also holds for a caller that enqueues this Workflow directly with an untyped payload.
+  //
+  // It ends the instance ERRORED, without a retry, so the refusal shows on the Workflows dashboard
+  // instead of reading as a run that completed. The throw sits before the `try` below on purpose: that
+  // catch turns a throw into an `access.failed`, and an event the worker did not understand must not
+  // announce anything.
+  if (!isKnownEventType(event.event_type)) {
+    log('error', 'workflow refused an unknown event_type', {
+      adapter,
+      transaction_id: event.transaction_id,
+      event_type: event.event_type,
+      origin,
+    })
+    throw new NonRetryableError(
+      'unknown event_type: nothing was granted, revoked or sent',
+    )
+  }
+
   const config = resolveProductConfig(map, adapter, event.product_id)
+  const revokeProgress: RevokeProgress = { holder: null }
 
   try {
     if (event.event_type === 'payment_success') {
@@ -2152,7 +2228,17 @@ export async function executeAccessWorkflow(
     } else {
       // runRevoke resolves its own product config from the grant record's product_id - the event's
       // product_id is unreliable on refund/adjustment events (see runRevoke).
-      await runRevoke(step, env, org, origin, adapter, event, map, sink)
+      await runRevoke(
+        step,
+        env,
+        org,
+        origin,
+        adapter,
+        event,
+        map,
+        sink,
+        revokeProgress,
+      )
     }
   } catch (err) {
     log('error', 'workflow terminal failure', {
@@ -2200,6 +2286,18 @@ export async function executeAccessWorkflow(
         map,
         sink,
       )
+    } else if (!failureAlreadyReported.has(err as object)) {
+      // A revoke that died the same way: the buyer may still hold access, so the seller has to hear
+      // it. The handle and teams come from the grant record once it was resolved; before that the
+      // envelope carries neither key rather than the refund event's handle, which is not who holds
+      // access. Nothing else moves: no access.revoked, and KV is left exactly as the throw left it.
+      // A degraded-token abort has already emitted its own access.failed and is skipped here.
+      await emitEvent(step, org, origin, sink, 'access.failed', event, {
+        ...(revokeProgress.holder ?? {}),
+        status: 'failure',
+        reason: 'revoke_error',
+        trigger: event.event_type,
+      })
     }
     throw err // mark the Workflow instance failed for observability (the event already fired)
   }

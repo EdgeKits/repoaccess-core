@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Gary Stupak
 
-import { env as testEnv } from 'cloudflare:test'
+import { env as testEnv, runInDurableObject } from 'cloudflare:test'
+import { NonRetryableError } from 'cloudflare:workflows'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { createWorker } from '../src/create-worker'
 import { executeAccessWorkflow } from '../src/workflow/workflow'
 import { apiCallbackInstanceId } from '../src/workflow/workflow-id'
 import type { EventEnvelope } from '../src/events'
-import type { AccessWorkflowParams, RepoAccessConfig } from '../src/types'
+import type {
+  AccessWorkflowParams,
+  NormalizedEvent,
+  PaymentAdapter,
+  RepoAccessConfig,
+} from '../src/types'
 import { makeStep, mockConfig, mockEnv } from './helpers'
 import {
   apiCallbackMock,
@@ -360,5 +366,85 @@ describe('AccessWorkflow - api_callback fetch + parse', () => {
       'unverifiable_adapter',
     )
     expect(await env.ENTITLEMENTS.get('grant:cbmock:sale_4')).toBeNull()
+  })
+
+  it('fetched entity parses to an unknown event_type → no GitHub call, no event, grant and guard untouched, one error logged, ends Errored', async () => {
+    const env = makeEnv()
+    // An existing grant on an auto_revoke product: the revoke path, which an unknown type used to fall
+    // into, would remove this buyer.
+    const grantRecord = JSON.stringify({
+      github_username: 'octocat',
+      org: 'testorg',
+      teams: ['kit-pro'],
+      product_id: 'prod_cb',
+      granted_at: '2026-01-01T00:00:00Z',
+    })
+    await env.ENTITLEMENTS.put('grant:cbmock:sale_6', grantRecord)
+    const ghCalls: string[] = []
+    mockFetch({
+      provider: (id) => ({
+        status: 200,
+        body: { id, kind: 'refund', product_id: 'prod_cb' },
+      }),
+      github: (m, p) => {
+        ghCalls.push(`${m} ${p}`)
+        if (m === 'DELETE') return { status: 204 }
+        if (m === 'GET' && p.startsWith('/orgs/testorg/invitations'))
+          return { status: 200, body: [] }
+        return { status: 404 }
+      },
+    })
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const { events, sink } = recorder()
+    // A verified fetch, then a parse that names a type this worker does not know (an untyped adapter).
+    const base = apiCallbackMock()
+    const unknownTypeAdapter: PaymentAdapter = {
+      ...base,
+      parse: (raw, entity) => {
+        const parsed = base.parse(raw, entity)
+        return parsed === null
+          ? null
+          : ({
+              ...parsed,
+              event_type: 'subscription_renewed',
+            } as unknown as NormalizedEvent)
+      },
+    }
+
+    await expect(
+      executeAccessWorkflow(
+        makeStep().step,
+        env,
+        makeConfig(),
+        // The route enqueues an api_callback ping with `origin: 'webhook'`.
+        { ...pingParams('sale_6'), origin: 'webhook' },
+        sink,
+        [unknownTypeAdapter],
+      ),
+    ).rejects.toThrow(NonRetryableError)
+
+    expect(ghCalls).toEqual([])
+    expect(events).toEqual([])
+    expect(await env.ENTITLEMENTS.get('grant:cbmock:sale_6')).toBe(grantRecord)
+    const ns = testEnv.CLAIM_GUARD
+    expect(
+      await runInDurableObject(
+        ns.get(ns.idFromName('cbmock:sale_6')),
+        async (_i, s) => [...(await s.storage.list()).keys()],
+      ),
+    ).toEqual([])
+    const refused = logSpy.mock.calls
+      .map((call) => JSON.parse(String(call[0])) as Record<string, unknown>)
+      .filter((entry) => entry.msg === 'workflow refused an unknown event_type')
+    expect(refused).toEqual([
+      {
+        level: 'error',
+        msg: 'workflow refused an unknown event_type',
+        adapter: 'cbmock',
+        transaction_id: 'sale_6',
+        event_type: 'subscription_renewed',
+        origin: 'webhook',
+      },
+    ])
   })
 })

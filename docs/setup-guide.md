@@ -37,7 +37,7 @@ Two of Cloudflare's free-plan limits are the ones that bind here: **1,000 KV wri
 | ------------------------------------------------------------- | -------------- | --------- | ---------- |
 | Sale in `username` mode (the handle arrived with the payment) | 8              | 2         | 0          |
 | Sale in `claim` mode (the buyer enters their handle)          | 13             | 5         | 2          |
-| Refund or chargeback, access revoked                          | 11 to 12       | 0         | 1          |
+| Refund, chargeback or ended access, access revoked            | 11 to 12       | 0         | 1          |
 
 Those figures are for the Stripe adapter, one team per product, and a buyer who is not already a
 member. One step and one write of each sale is the alias that lets your `success_url` redirect resolve
@@ -297,7 +297,9 @@ support.
 
 ## Step 4 - Stripe
 
-1. **Create your product + price** in the Stripe dashboard. Note the **product id** (`prod_…`).
+1. **Create your product + a one-time price** in the Stripe dashboard. Note the **product id** (`prod_…`).
+   Core sells one-time access: a checkout for a recurring (subscription) price grants nothing in core.
+   Subscriptions are a RepoAccess Pro feature.
 2. **Create a webhook** (Developers → Webhooks (Event destinations) → Add destination) pointing at your
    worker:
    `https://<your-worker-url>/wh/stripe/<SECRET_PATH>`
@@ -419,6 +421,11 @@ The options, in full:
     the same buyer still entitles them; absent when it kept none, and `teams` still names every team on the
     refunded grant. A purchase whose grant fails after a refund kept a team for it gets an `access.revoked`
     of its own, naming only the team it withdraws.
+  - **`trigger`** - on `access.revoked`, what ended the access: `refund`, `chargeback`, or `access_ended`
+    when the access itself ran out (a subscription ended, a term expired) rather than money going back.
+    Core's Stripe adapter never sends `access_ended`; an adapter that sells subscriptions or time-limited
+    access does, and the worker revokes on it whatever the product's `revoke_policy` says, because that
+    policy governs refunds.
   - **`sequence`** - `access.granted`, `access.revoked`, and an `access.failed` whose `reason` is
     `transaction_revoked` carry a number. For one transaction, the event with the higher `sequence` is
     the current state, whatever order they arrive in; `timestamp` is when the event was sent, not an
@@ -566,8 +573,9 @@ two `grant_mode`s:
   the **...** menu, choose **Edit**, then **Advanced options → Add custom fields**. (Or set
   `custom_fields` when creating the Checkout Session.) The label is not an example - Stripe derives the
   field's key from it, and the worker resolves the field by matching a key that contains `github`, so
-  give it exactly that label. The worker reads it from the `checkout.session.completed` event. Leave the
-  field **optional** - an empty or mistyped handle is not a dead end, it falls back to the claim page.
+  give it exactly that label. The worker reads it from the `checkout.session.completed` event. Tick
+  **Mark as optional** under the field (Stripe makes it required by default) - an empty or mistyped
+  handle is not a dead end, it falls back to the claim page.
   - _Your own checkout page:_ if you collect the username yourself before checkout, pass it through as
     `metadata.github_username` and the worker reads it from the same event.
 - **After checkout (`claim` mode).** Collect nothing at checkout. The buyer receives a one-time claim
@@ -625,7 +633,8 @@ Take the resulting `https://<worker>.workers.dev` URL and make sure your Stripe 
 
 ## Step 8 - Test it
 
-Do a **test-mode purchase** in Stripe (card `4242 4242 4242 4242`, any future expiry / CVC). Use a
+Do a **test purchase** in a Stripe sandbox or test mode (card `4242 4242 4242 4242`, any future expiry /
+CVC). Use a
 **second GitHub account** as the buyer, not your org-owner account: the buyer loop is invite, accept, then
 refund, and an account already in the org never receives an invite at all. You should see:
 
@@ -670,18 +679,23 @@ are quick to resolve. Work down this list.
    invite (Org → People → **Pending invitations**), then re-collect: re-send the claim link, or just
    invite them by hand (Team → Members → **Add a member**).
 3. **`access.failed → github_token_degraded`** = the worker's GitHub token can no longer manage
-   members (expired, revoked, or the org restricted fine-grained tokens). **On a refund this is the
-   one reason that needs your hands right away: the buyer's access was NOT revoked.** Rotate the
+   members (expired, revoked, or the org restricted fine-grained tokens). **On a refund this needs
+   your hands right away (as `revoke_error` below does): the buyer's access was NOT revoked.** Rotate the
    token first - mint a fresh fine-grained PAT, paste it into your secrets file, redeploy - then
    finish that revoke manually: Org → People → remove the buyer from the product team (and from the
    org if they hold no other product team). The event carries the username and teams, and the grant
    record is kept in KV as your diagnostic.
-4. **`access.failed → rate-limited` (`429`)** = new-org invite cap (50/24h in the first month). The
+4. **`access.failed → revoke_error`** = a refund or chargeback could not finish: GitHub kept failing
+   through every retry (about three hours of them), or something else broke mid-revoke. **The buyer's
+   access may NOT have been removed.** When the worker had already read the purchase, the event carries
+   the username and teams: remove the buyer from the product team by hand (and from the org if they hold
+   no other product team), then look in your worker's log for the cause.
+5. **`access.failed → rate-limited` (`429`)** = new-org invite cap (50/24h in the first month). The
    worker backs off and retries automatically - it'll land within the window. For a launch, age the
    org first.
-5. **`claim.pending`, never completed** = the buyer didn't finish the claim page. Claim links are
+6. **`claim.pending`, never completed** = the buyer didn't finish the claim page. Claim links are
    **single-use and expire after 30 days** - re-issue a fresh link if theirs lapsed.
-6. **No event at all** = the webhook didn't arrive or didn't verify. Check Stripe sent it (re-send it
+7. **No event at all** = the webhook didn't arrive or didn't verify. Check Stripe sent it (re-send it
    from the dashboard), the URL + secret path are right, and signature verification passed (a
    transformed/re-serialized body breaks the HMAC - see above).
 
@@ -732,6 +746,6 @@ reconciliation. The one known exception is a team both products share when one o
 The engine itself is provider-agnostic - it normalizes any webhook-capable provider behind the adapter
 contract, and the exported types (`PaymentAdapter`, `VerificationStrategy`) are what an adapter
 implements. Core ships Stripe as the reference adapter. Ready-made adapters for Paddle
-(Merchant-of-Record), Lemon Squeezy (Merchant-of-Record), Gumroad, Razorpay and Telegram Stars ship in
-**RepoAccess Pro**, along with their provider-specific wiring. See the
+(Merchant-of-Record), Creem (Merchant-of-Record), Gumroad, Razorpay and Telegram Stars ship in
+**RepoAccess Pro**, along with their provider-specific wiring, and Pro adds subscriptions. See the
 [RepoAccess page](https://edgekits.dev/en/tools/repoaccess/).

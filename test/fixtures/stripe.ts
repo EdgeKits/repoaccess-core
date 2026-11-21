@@ -89,6 +89,25 @@ export const sessionNoPaymentRequired = fixture(
   '{"type":"checkout.session.completed","data":{"object":{"id":"cs_test_free","payment_status":"no_payment_required","payment_intent":null,"metadata":{"product_id":"prod_ABC","github_username":"octocat"}}}}',
 )
 
+/**
+ * A Checkout Session for a recurring price (`mode: subscription`). Core sells one-time access, and a
+ * subscription-mode session never carries a `payment_intent` (the first payment belongs to the
+ * subscription's invoice), so neither kind below can grant. Paid at checkout, and a free trial, which
+ * completes with nothing to pay yet.
+ */
+const SUBSCRIPTION_SESSION_FIELDS =
+  '"id":"cs_test_sub","mode":"subscription","payment_intent":null,"subscription":"sub_test_1","customer_details":{"email":"buyer@example.com"},"metadata":{"product_id":"prod_ABC","github_username":"octocat"}'
+
+export const sessionSubscriptionPaid = fixture(
+  'checkout.session.completed (paid) for a subscription - no payment_intent',
+  `{"type":"checkout.session.completed","data":{"object":{${SUBSCRIPTION_SESSION_FIELDS},"payment_status":"paid"}}}`,
+)
+
+export const sessionSubscriptionTrial = fixture(
+  'checkout.session.completed (no_payment_required) for a subscription with a free trial',
+  `{"type":"checkout.session.completed","data":{"object":{${SUBSCRIPTION_SESSION_FIELDS},"payment_status":"no_payment_required"}}}`,
+)
+
 /** charge.refunded, full (amount_refunded === amount) → refund, is_full_refund true, same pi. */
 export const chargeRefundedFull = fixture(
   'charge.refunded (full) - same payment_intent as sessionPaid',

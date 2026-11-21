@@ -346,7 +346,7 @@ export async function completeClaim(
   // later sequential corrected resubmit can acquire.
   const guard = claimGuard(env, claim.adapter, claim.transaction_id)
   const acq = await guard.acquire()
-  // A REVOKED transaction (refund/dispute) is not "busy" - the claim is gone for good, so it reports
+  // A REVOKED transaction (refund, dispute or ended access) is not "busy" - the claim is gone for good, so it reports
   // exactly like a consumed or expired token and renders the existing `invalid` 404 view. The revoke
   // path also deletes `claim:{token}`, so this branch is normally unreachable; it is what closes the
   // window where that delete has not propagated yet (KV is eventually consistent) or where the submit

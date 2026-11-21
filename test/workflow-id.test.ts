@@ -15,6 +15,16 @@ describe('workflowInstanceId', () => {
     ).toBe('stripe-payment_success-pi_123')
   })
 
+  it('access_ended → <adapter>-access_ended-<transaction_id>, with no refund scope suffix', async () => {
+    expect(
+      await workflowInstanceId('stripe', 'access_ended', 'pi_123', null),
+    ).toBe('stripe-access_ended-pi_123')
+    // A stray full-refund flag cannot add a scope: the suffix is gated on the refund event type.
+    expect(
+      await workflowInstanceId('stripe', 'access_ended', 'pi_123', true),
+    ).toBe('stripe-access_ended-pi_123')
+  })
+
   it('hashes an out-of-charset transaction_id instead of throwing, staying valid + bounded', async () => {
     const id = await workflowInstanceId(
       'stripe',

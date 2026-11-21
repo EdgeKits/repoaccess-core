@@ -170,3 +170,32 @@ describe('createWorker - shared_secret_header ack path', () => {
     expect(env.ACCESS_WORKFLOW.createBatch).not.toHaveBeenCalled()
   })
 })
+
+describe('createWorker - an access_ended event enqueues under its own deterministic id', () => {
+  it('parse → access_ended → one enqueue under <adapter>-access_ended-<txn>', async () => {
+    const env = mockEnv()
+    const adapter = sharedSecretMock()
+    // No shipped adapter emits access_ended, so the synthetic one is made to, for this test only.
+    vi.spyOn(adapter, 'parse').mockReturnValue({
+      event_type: 'access_ended',
+      product_id: '',
+      transaction_id: 'txn_ended',
+      buyer_email: null,
+      github_username: null,
+      is_full_refund: null,
+    })
+    const app = createWorker({ adapters: [adapter], config: mockConfig() })
+
+    const res = await app.request(
+      '/wh/sshmock/x',
+      secretHeaderPost(payment('txn_ended')),
+      env,
+    )
+
+    expect(res.status).toBe(200)
+    const calls = (env.ACCESS_WORKFLOW.createBatch as ReturnType<typeof vi.fn>)
+      .mock.calls
+    expect(calls).toHaveLength(1)
+    expect(calls[0][0][0].id).toBe('sshmock-access_ended-txn_ended')
+  })
+})

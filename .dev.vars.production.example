@@ -1,7 +1,7 @@
-# .dev.vars.production.example - PRODUCTION/LIVE secrets template. Placeholders only, NO real values.
+# .dev.vars.production.example - production secrets template. Placeholders only, NO real values.
 #
 # Copy this to `.dev.vars.production` (the real file is gitignored and never committed), then replace
-# each `__REPLACE_ME__` with YOUR live value. Deploy uploads them:
+# each `__REPLACE_ME__` with YOUR value. Deploy uploads them:
 # `npx wrangler deploy --env production --secrets-file .dev.vars.production`.
 # These names come from wrangler.jsonc `[env.production]` `secrets.required` (sourced from the production
 # env, which MAY diverge from base). Secret VALUES live only in `.dev.vars.production`.
@@ -11,13 +11,14 @@
 GITHUB_TOKEN=__REPLACE_ME__
 
 # Stripe webhook signing secret (whsec_…) from THIS env's Stripe webhook.
-# In this production file: the LIVE-mode secret. (In .dev.vars.example: the TEST secret.)
+# In this production file: the secret of the webhook your production worker receives - the sandbox one
+# while you test, the live one once you go live. (In .dev.vars.example: the sandbox one.)
 STRIPE_WEBHOOK_SECRET=__REPLACE_ME__
 
 # Webhook URL path segment for /wh/stripe/<this>. NOT a worker secret (HMAC sig is the gate); it only
 # lives in your Stripe webhook URL. Generate: openssl rand -hex 16. Use a SEPARATE path for the
-# production webhook (different from your sandbox path). Kept commented just so you don't lose it -
-# the worker never reads it.
+# production webhook (different from the path of your sandbox worker, the top-level environment
+# .dev.vars.example serves). Kept commented just so you don't lose it - the worker never reads it.
 # STRIPE_WEBHOOK_PATH="REPLACE_WITH_openssl_rand_-hex_16"
 
 # OPTIONAL - outbound signed event delivery. Only set this if you also set `eventWebhook.url` in

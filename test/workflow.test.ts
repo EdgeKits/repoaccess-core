@@ -6,6 +6,7 @@ import {
   listDurableObjectIds,
   runInDurableObject,
 } from 'cloudflare:test'
+import { NonRetryableError } from 'cloudflare:workflows'
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { makeStep } from './helpers'
 import {
@@ -596,6 +597,58 @@ describe('AccessWorkflow - grant', () => {
     expect(await env.ENTITLEMENTS.get('fail:stripe:pi_1')).toBe('grant_error')
   })
 
+  // The revoke-side twin of the test above. A refund or dispute whose GitHub calls fail through every
+  // retry must not end on a log line alone: the buyer may still hold the team, and the seller is the
+  // only one who can finish the job, so exactly one access.failed has to reach them. Its handle and
+  // teams come from the grant RECORD, because the refund event typically carries no handle at all.
+  for (const trigger of ['refund', 'chargeback'] as const) {
+    it(`${trigger} dies on exhausted GitHub retries → one access.failed reason revoke_error, no access.revoked, grant record kept, then rethrows`, async () => {
+      const env = makeEnv()
+      const config = makeConfig()
+      await env.ENTITLEMENTS.put('grant:stripe:pi_1', GRANT_RECORD)
+      // The team-membership DELETE always answers 500, so ghStep exhausts its retries and throws.
+      mockFetch((m, p) =>
+        m === 'DELETE' &&
+        p === '/orgs/testorg/teams/kit-pro/memberships/octocat'
+          ? { status: 500 }
+          : { status: 404 },
+      )
+      const { step, sleeps } = makeStep()
+      const { events, sink } = recorder()
+
+      await expect(
+        executeAccessWorkflow(
+          step,
+          env,
+          config,
+          {
+            adapter: 'stripe',
+            event: evt({
+              event_type: trigger,
+              is_full_refund: trigger === 'refund' ? true : null,
+              github_username: null,
+            }),
+          },
+          sink,
+        ),
+      ).rejects.toThrow(/GitHub unavailable/)
+
+      const failed = events.filter((e) => e.event_type === 'access.failed')
+      expect(failed).toHaveLength(1)
+      expect(failed[0]).toMatchObject({
+        reason: 'revoke_error',
+        status: 'failure',
+        github_username: 'octocat',
+        teams: ['kit-pro'],
+        trigger,
+      })
+      expect(typesOf(events)).not.toContain('access.revoked')
+      expect(await env.ENTITLEMENTS.get('grant:stripe:pi_1')).toBe(GRANT_RECORD)
+      // The total the MAX_GH_ATTEMPTS comment states: 1, 2, 4, 8, 16, 32, 60, 60 minutes.
+      expect(sleeps.reduce((a, b) => a + b, 0)).toBe(183 * 60_000)
+    })
+  }
+
   it('non-claim terminal GitHub error (team-get 403) → access.failed + fail marker, no grant/claim', async () => {
     const env = makeEnv()
     const config = makeConfig()
@@ -957,10 +1010,11 @@ describe('AccessWorkflow - revoke', () => {
           // The seller is never told access went away when it did not.
           expect(typesOf(events)).not.toContain('access.revoked')
 
-          // ...and IS told what broke, with what they need to finish by hand.
-          expect(
-            events.find((e) => e.event_type === 'access.failed'),
-          ).toMatchObject({
+          // ...and IS told what broke, with what they need to finish by hand - ONCE. The terminal
+          // catch's revoke_error must not add a second access.failed for the same instance.
+          const failed = events.filter((e) => e.event_type === 'access.failed')
+          expect(failed).toHaveLength(1)
+          expect(failed[0]).toMatchObject({
             github_username: 'octocat',
             teams: ['kit-pro'],
             reason: 'github_token_degraded',
@@ -1727,7 +1781,7 @@ describe('AccessWorkflow - a malformed stored record fails terminally', () => {
       .map((call) => JSON.parse(String(call[0])) as Record<string, unknown>)
       .filter((entry) => entry.msg === 'workflow terminal failure')
 
-  it('malformed grant record → terminal catch, re-thrown, no event, no GitHub call, record untouched', async () => {
+  it('malformed grant record → terminal catch, re-thrown, one access.failed(revoke_error) without handle or teams, no GitHub call, record untouched', async () => {
     const env = makeEnv()
     await env.ENTITLEMENTS.put('grant:stripe:pi_1', '{not json')
     const fetchSpy = mockFetch(() => ({ status: 500 }))
@@ -1752,14 +1806,22 @@ describe('AccessWorkflow - a malformed stored record fails terminally', () => {
       transaction_id: 'pi_1',
       event_type: 'refund',
     })
-    // A revoke emits nothing from that catch (access.failed is the payment_success arm only).
-    expect(typesOf(events)).toEqual([])
+    // The seller hears that the revoke died. The record never resolved, so the envelope names no
+    // handle and no teams rather than guessing them from the refund event.
+    expect(typesOf(events)).toEqual(['access.failed'])
+    expect(events[0]).toMatchObject({
+      reason: 'revoke_error',
+      status: 'failure',
+      trigger: 'refund',
+    })
+    expect(events[0]).not.toHaveProperty('github_username')
+    expect(events[0]).not.toHaveProperty('teams')
     expect(fetchSpy).not.toHaveBeenCalled()
     // Nothing was withdrawn and nothing was deleted: the malformed record is still exactly as stored.
     expect(await env.ENTITLEMENTS.get('grant:stripe:pi_1')).toBe('{not json')
   })
 
-  it('malformed claim record → terminal catch, re-thrown, no event, claim + index left in place', async () => {
+  it('malformed claim record → terminal catch, re-thrown, one access.failed(revoke_error), claim + index left in place', async () => {
     const env = makeEnv()
     // No grant record, so the revoke takes the pending-claim path: the index resolves, then the claim
     // record itself fails to parse.
@@ -1781,7 +1843,13 @@ describe('AccessWorkflow - a malformed stored record fails terminally', () => {
     ).rejects.toThrow(SyntaxError)
 
     expect(terminalFailures(logSpy)).toHaveLength(1)
-    expect(typesOf(events)).toEqual([])
+    expect(typesOf(events)).toEqual(['access.failed'])
+    expect(events[0]).toMatchObject({
+      reason: 'revoke_error',
+      trigger: 'refund',
+    })
+    expect(events[0]).not.toHaveProperty('github_username')
+    expect(events[0]).not.toHaveProperty('teams')
     expect(fetchSpy).not.toHaveBeenCalled()
     // The token is a live bearer credential and this run did NOT decide anything about it, so it must
     // still be here for the retry that can.
@@ -1790,4 +1858,330 @@ describe('AccessWorkflow - a malformed stored record fails terminally', () => {
       'tok_malformed',
     )
   })
+})
+
+// An adapter that sells subscriptions or time-limited access reports "this access ran out" as
+// `access_ended`. It is not money going back, so the product's revoke policy, which governs refunds,
+// does not apply: it revokes always, through the same path a refund takes, and says what it was.
+describe('AccessWorkflow - access_ended (the access itself ran out)', () => {
+  // Products under the two policies a refund would NOT revoke on here: the default (no policy at all,
+  // which resolves to log_only), and full_refund_only with an event that carries no full-refund flag.
+  const ENDED_PTM: ProductTeamMap = {
+    stripe: {
+      prod_default: { teams: ['kit-pro'], grant_mode: 'username' },
+      prod_full_only: {
+        teams: ['kit-pro'],
+        grant_mode: 'username',
+        revoke_policy: { mode: 'auto_revoke', full_refund_only: true },
+      },
+    },
+    defaults: {
+      teams: [],
+      grant_mode: 'claim',
+      revoke_policy: { mode: 'log_only' },
+    },
+  }
+
+  const grantRecord = (productId: string) =>
+    JSON.stringify({
+      github_username: 'octocat',
+      org: 'testorg',
+      teams: ['kit-pro'],
+      product_id: productId,
+      granted_at: '2026-01-01T00:00:00Z',
+    })
+
+  // Like a refund, the event carries no usable product id: the revoke resolves it from the grant record.
+  const ended = (over: Partial<NormalizedEvent> = {}) =>
+    evt({
+      event_type: 'access_ended',
+      product_id: '',
+      github_username: null,
+      is_full_refund: null,
+      ...over,
+    })
+
+  // A GitHub where octocat holds kit-pro with an accepted membership; records every call.
+  function memberGithub(calls: string[]) {
+    return mockFetch((m, p) => {
+      calls.push(`${m} ${p}`)
+      if (
+        m === 'DELETE' &&
+        p === '/orgs/testorg/teams/kit-pro/memberships/octocat'
+      )
+        return { status: 204 }
+      if (m === 'GET' && p.startsWith('/orgs/testorg/invitations'))
+        return { status: 200, body: [] }
+      if (m === 'DELETE' && p === '/orgs/testorg/memberships/octocat')
+        return { status: 204 }
+      return { status: 404 }
+    })
+  }
+
+  async function guardFacts(txn = 'pi_1') {
+    const ns = testEnv.CLAIM_GUARD
+    return runInDurableObject(ns.get(ns.idFromName(`stripe:${txn}`)), (_i, s) =>
+      s.storage.get<unknown[]>('refunds'),
+    )
+  }
+
+  it('default log_only product: removes the buyer, access.revoked trigger access_ended, guard records access_ended', async () => {
+    const env = makeEnv()
+    const config = makeConfig(ENDED_PTM)
+    await env.ENTITLEMENTS.put('grant:stripe:pi_1', grantRecord('prod_default'))
+    const calls: string[] = []
+    memberGithub(calls)
+    const { step } = makeStep()
+    const { events, sink } = recorder()
+
+    await executeAccessWorkflow(
+      step,
+      env,
+      config,
+      { adapter: 'stripe', event: ended() },
+      sink,
+    )
+
+    expect(calls).toContain(
+      'DELETE /orgs/testorg/teams/kit-pro/memberships/octocat',
+    )
+    expect(calls).toContain('DELETE /orgs/testorg/memberships/octocat')
+    expect(await env.ENTITLEMENTS.get('grant:stripe:pi_1')).toBeNull()
+    const revoked = events.find((e) => e.event_type === 'access.revoked')
+    expect(revoked).toMatchObject({
+      github_username: 'octocat',
+      teams: ['kit-pro'],
+      trigger: 'access_ended',
+    })
+    expect(typeof revoked?.sequence).toBe('number')
+    expect(await guardStatus()).toBe('revoked')
+    // Recorded as itself, never as a refund.
+    expect(await guardFacts()).toEqual([
+      { event_type: 'access_ended', is_full_refund: null },
+    ])
+  })
+
+  it('full_refund_only product: access_ended with no full-refund flag still revokes', async () => {
+    const env = makeEnv()
+    const config = makeConfig(ENDED_PTM)
+    await env.ENTITLEMENTS.put(
+      'grant:stripe:pi_1',
+      grantRecord('prod_full_only'),
+    )
+    const calls: string[] = []
+    memberGithub(calls)
+    const { step } = makeStep()
+    const { events, sink } = recorder()
+
+    await executeAccessWorkflow(
+      step,
+      env,
+      config,
+      { adapter: 'stripe', event: ended() },
+      sink,
+    )
+
+    expect(calls).toContain(
+      'DELETE /orgs/testorg/teams/kit-pro/memberships/octocat',
+    )
+    expect(await env.ENTITLEMENTS.get('grant:stripe:pi_1')).toBeNull()
+    expect(events.find((e) => e.event_type === 'access.revoked')).toMatchObject(
+      { trigger: 'access_ended' },
+    )
+  })
+
+  it('a late payment_success after access_ended grants nothing, even on a log_only product', async () => {
+    const env = makeEnv()
+    const config = makeConfig(ENDED_PTM)
+    await env.ENTITLEMENTS.put('grant:stripe:pi_1', grantRecord('prod_default'))
+    const calls: string[] = []
+    memberGithub(calls)
+    await executeAccessWorkflow(
+      makeStep().step,
+      env,
+      config,
+      { adapter: 'stripe', event: ended() },
+      recorder().sink,
+    )
+
+    calls.length = 0
+    const late = recorder()
+    await executeAccessWorkflow(
+      makeStep().step,
+      env,
+      config,
+      {
+        adapter: 'stripe',
+        event: evt({ product_id: 'prod_default', github_username: 'octocat' }),
+      },
+      late.sink,
+    )
+
+    expect(calls.filter((c) => c.startsWith('PUT '))).toEqual([])
+    expect(typesOf(late.events)).not.toContain('access.granted')
+    expect(
+      late.events.find((e) => e.event_type === 'access.failed'),
+    ).toMatchObject({ reason: 'transaction_revoked', trigger: 'access_ended' })
+    expect(await env.ENTITLEMENTS.get('grant:stripe:pi_1')).toBeNull()
+    expect(await env.ENTITLEMENTS.get('claim_txn:stripe:pi_1')).toBeNull()
+  })
+
+  it('access_ended with no grant and no claim tombstones the transaction, so a later grant is refused', async () => {
+    const env = makeEnv()
+    const config = makeConfig(ENDED_PTM)
+    const calls: string[] = []
+    memberGithub(calls)
+    await executeAccessWorkflow(
+      makeStep().step,
+      env,
+      config,
+      { adapter: 'stripe', event: ended() },
+      recorder().sink,
+    )
+    expect(await guardStatus()).toBe('revoked')
+
+    const late = recorder()
+    await executeAccessWorkflow(
+      makeStep().step,
+      env,
+      config,
+      {
+        adapter: 'stripe',
+        event: evt({ product_id: 'prod_default', github_username: 'octocat' }),
+      },
+      late.sink,
+    )
+    expect(calls.filter((c) => c.startsWith('PUT '))).toEqual([])
+    expect(failedReason(late.events)).toBe('transaction_revoked')
+  })
+
+  it('access_ended dies on exhausted GitHub retries → one access.failed reason revoke_error with trigger access_ended, then rethrows', async () => {
+    const env = makeEnv()
+    const config = makeConfig(ENDED_PTM)
+    await env.ENTITLEMENTS.put('grant:stripe:pi_1', grantRecord('prod_default'))
+    mockFetch((m, p) =>
+      m === 'DELETE' && p === '/orgs/testorg/teams/kit-pro/memberships/octocat'
+        ? { status: 500 }
+        : { status: 404 },
+    )
+    const { step } = makeStep()
+    const { events, sink } = recorder()
+
+    await expect(
+      executeAccessWorkflow(
+        step,
+        env,
+        config,
+        { adapter: 'stripe', event: ended() },
+        sink,
+      ),
+    ).rejects.toThrow(/GitHub unavailable/)
+
+    const failed = events.filter((e) => e.event_type === 'access.failed')
+    expect(failed).toHaveLength(1)
+    expect(failed[0]).toMatchObject({
+      reason: 'revoke_error',
+      status: 'failure',
+      github_username: 'octocat',
+      teams: ['kit-pro'],
+      trigger: 'access_ended',
+    })
+    expect(typesOf(events)).not.toContain('access.revoked')
+    expect(await env.ENTITLEMENTS.get('grant:stripe:pi_1')).toBe(
+      grantRecord('prod_default'),
+    )
+  })
+})
+
+// An event type outside the four this worker knows does nothing at all, and ends the instance Errored
+// so the refusal is visible. Without the check, every type that is not `payment_success` would fall
+// into the revoke path and remove a paying buyer.
+describe('AccessWorkflow - an unknown event_type does nothing', () => {
+  const AUTO_PTM: ProductTeamMap = {
+    stripe: {
+      prod_auto: {
+        teams: ['kit-pro'],
+        grant_mode: 'username',
+        revoke_policy: { mode: 'auto_revoke' },
+      },
+    },
+    defaults: {
+      teams: [],
+      grant_mode: 'claim',
+      revoke_policy: { mode: 'log_only' },
+    },
+  }
+
+  const AUTO_GRANT_RECORD = JSON.stringify({
+    github_username: 'octocat',
+    org: 'testorg',
+    teams: ['kit-pro'],
+    product_id: 'prod_auto',
+    granted_at: '2026-01-01T00:00:00Z',
+  })
+
+  // Values that reach the Workflow untyped (an RPC caller enqueues whatever it likes): a plausible
+  // name, a known name in the wrong case, and no value at all.
+  it.each(['subscription_renewed', 'REFUND', undefined])(
+    'event_type %s on an auto_revoke product with a grant: no GitHub call, no event, grant kept, one error logged, ends Errored',
+    async (unknownType) => {
+      const env = makeEnv()
+      await env.ENTITLEMENTS.put('grant:stripe:pi_1', AUTO_GRANT_RECORD)
+      const fetchSpy = mockFetch((m, p) =>
+        m === 'DELETE' && p.includes('/memberships/octocat')
+          ? { status: 204 }
+          : m === 'GET' && p.startsWith('/orgs/testorg/invitations')
+            ? { status: 200, body: [] }
+            : { status: 404 },
+      )
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+      const { step } = makeStep()
+      const { events, sink } = recorder()
+      const event = {
+        ...evt({ product_id: '', github_username: null }),
+        event_type: unknownType,
+      } as unknown as NormalizedEvent
+
+      // Errored, not retried: the instance ends on a NonRetryableError, which `run()` does not catch.
+      await expect(
+        executeAccessWorkflow(
+          step,
+          env,
+          makeConfig(AUTO_PTM),
+          { adapter: 'stripe', event, origin: 'rpc' },
+          sink,
+        ),
+      ).rejects.toThrow(NonRetryableError)
+
+      expect(fetchSpy).not.toHaveBeenCalled()
+      expect(events).toEqual([])
+      expect(await env.ENTITLEMENTS.get('grant:stripe:pi_1')).toBe(
+        AUTO_GRANT_RECORD,
+      )
+      // The WHOLE guard, not just its status: a revoke's first write (`recordRefund`) stores the
+      // refund's facts and leaves `status` alone, and those facts would refuse a later grant.
+      const ns = testEnv.CLAIM_GUARD
+      expect(
+        await runInDurableObject(
+          ns.get(ns.idFromName('stripe:pi_1')),
+          async (_i, s) => [...(await s.storage.list()).keys()],
+        ),
+      ).toEqual([])
+      const refused = logSpy.mock.calls
+        .map((call) => JSON.parse(String(call[0])) as Record<string, unknown>)
+        .filter(
+          (entry) => entry.msg === 'workflow refused an unknown event_type',
+        )
+      expect(refused).toEqual([
+        {
+          level: 'error',
+          msg: 'workflow refused an unknown event_type',
+          adapter: 'stripe',
+          transaction_id: 'pi_1',
+          ...(unknownType === undefined ? {} : { event_type: unknownType }),
+          origin: 'rpc',
+        },
+      ])
+    },
+  )
 })

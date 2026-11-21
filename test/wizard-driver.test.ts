@@ -603,11 +603,11 @@ describe('screen wording', () => {
     )
   })
 
-  it('the env question carries the note that Production still runs Stripe in test mode', async () => {
+  it('the env question carries the note that Production still runs Stripe on test data', async () => {
     const record = byId(await drive('sandbox', 'full'), 'env')
     expect(record.text).toBe('**Which environment are you setting up?**')
     expect(record.note).toBe(
-      '_This choice is about your worker, not your Stripe account. Even Production runs Stripe in test mode - going live with real cards is a separate, final step._',
+      '_This choice is about your worker, not your Stripe account. Even Production runs Stripe in a sandbox (or test mode on an older account) - going live with real cards is a separate, final step._',
     )
   })
 
@@ -769,8 +769,9 @@ describe('screen wording', () => {
   it('the payment-link screen carries all three points, metadata included', async () => {
     const record = byId(await drive('sandbox', 'full'), 'payment-link')
     expect(record.type).toBe('do')
-    // The button is **Create test payment link** in Test mode - maintainer-confirmed live 2026-07-16,
-    // and the wizard is always in Test mode. "New" is what the dashboard used to say; a deployer who
+    // The button is **Create test payment link** in a sandbox or Test mode - maintainer-confirmed live
+    // 2026-07-16 in Test mode and 2026-11-21 in a sandbox, and the wizard only ever runs Stripe on test
+    // data. "New" is what the dashboard used to say; a deployer who
     // reads it hunts for a button that is not on their screen. Payment links moved under Checkout -
     // maintainer-confirmed live 2026-10-03; the old top-level path is guarded for the same reason.
     expect(record.text).toContain(
@@ -780,7 +781,7 @@ describe('screen wording', () => {
     expect(record.text).not.toContain('**Payment Links ->')
     expect(record.text).toContain('Three things matter:')
     expect(record.text).toContain(
-      '**Advanced options -> Add custom fields**, add ONE field - Type **Text**, Label **GitHub username**.',
+      '**Advanced options -> Add custom fields**, add ONE field - Type **Text**, Label **GitHub username** - and tick **Mark as optional**, because Stripe makes the field required by default and a buyer who leaves it empty is sent to the claim page instead.',
     )
     // The step whose absence makes every Full run ack 200 and grant nothing.
     expect(record.text).toContain(
@@ -1394,13 +1395,13 @@ describe('closings (one per env x goal)', () => {
     expect(skipped.text).not.toContain('live-tested that path too')
   })
 
-  it('the full production closing names the test-mode gap and the two failure modes', async () => {
+  it('the full production closing names the test-data gap and the two failure modes', async () => {
     const record = byId(await drive('production', 'full'), 'closing')
     expect(record.text).toContain(
       'Done - your production worker is live on `access.example.com` and proven end to end.',
     )
     expect(record.text).toContain(
-      '**One thing stands between you and selling: Stripe is still in test mode.**',
+      '**One thing stands between you and selling: Stripe is still in a sandbox (or test mode).**',
     )
     expect(record.text).toContain(
       'wrong secret -> `401`; wrong product id -> `200` and nothing granted',
