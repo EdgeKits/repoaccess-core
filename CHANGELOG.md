@@ -11,6 +11,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions fol
 
 Nothing yet.
 
+## [3.3.1] - 2026-11-23
+
+### Fixed
+
+- `access.revoked` names the product that was revoked. It takes `product_id` from the purchase it withdraws
+  (the grant, or the pending claim) and falls back to the refund event's own value only when the purchase has
+  none. Before, a Stripe refund, whose event carries an empty product id, produced an `access.revoked` with
+  `product_id: ""`. The revoke itself was always right. If your endpoint keys on `product_id`, revoke events
+  now carry it.
+- The guides and the setup wizard say precisely what a buyer's typo does. A handle that matches no GitHub
+  account sends no invitation: the buyer lands on the claim page and corrects it there. A handle that matches
+  someone else's account invites that person. Several passages said every mistyped handle self-corrects, one
+  said a wrong handle could not let the wrong person in, and the troubleshooting entry for "user not found"
+  now matches what the worker does.
+- The README and guides no longer say RepoAccess Pro sells subscriptions. Subscription support is planned for
+  Pro, and the 3.3.0 entry below is corrected to match.
+
+### Changed
+
+- The Stripe guides and the setup wizard say to leave **Mark as optional** off on the GitHub username field,
+  so it stays required and every buyer has to give a handle. This reverses 3.3.0's advice. A Payment Link set
+  up either way keeps working.
+
 ## [3.3.0] - 2026-11-21
 
 ### Added
