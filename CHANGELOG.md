@@ -28,8 +28,9 @@ Nothing yet.
 - A new event type for adapters, `access_ended`: the access itself ran out (a subscription ended, a term
   expired), as opposed to money going back. The worker revokes on it whatever the product's `revoke_policy`
   says, since that policy governs refunds, and the `access.revoked` it sends carries `trigger: 'access_ended'`.
-  Core's Stripe adapter never emits it; it is there for adapters that sell subscriptions or time-limited
-  access. If you switch on `NormalizedEvent.event_type` or on an event's `trigger`, add the new value.
+  Core's Stripe adapter never emits it. It is groundwork for subscription support planned for RepoAccess
+  Pro, and it serves any adapter that sells time-limited access. If you switch on
+  `NormalizedEvent.event_type` or on an event's `trigger`, add the new value.
 
 ### Changed
 
@@ -47,7 +48,7 @@ Nothing yet.
 - README and setup guide: Lemon Squeezy is winding down (it stops processing payments on 31 March 2027),
   so RepoAccess Pro's provider list now names Creem in its place.
 - README and guides say plainly that core sells one-time access: a checkout for a recurring (subscription)
-  price grants nothing in core. Subscriptions are a RepoAccess Pro feature.
+  price grants nothing in core. Subscription support is planned for RepoAccess Pro.
 - An event whose type the engine does not know now does nothing: it logs an error and its Workflow instance
   ends as Errored. Before, anything that was not a payment was handled as a revoke, so a bad value from a
   custom adapter or an RPC caller could remove a buyer.

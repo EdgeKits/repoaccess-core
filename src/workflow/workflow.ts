@@ -700,6 +700,7 @@ async function runGrant(
       grantedTeams,
       afterWrite.revoked ? afterWrite.trigger : undefined,
       asSequence(commit.snapshot.sequence),
+      event.product_id,
     )
     if (fromClaim)
       await clearSubmittedMarker(step, env, adapter, event.transaction_id)
@@ -1143,6 +1144,7 @@ async function abandonRevokedGrant(
       grantedTeams,
       revocation.trigger,
       revocation.sequence,
+      event.product_id,
     )
   } else {
     // Nothing of this grant reached GitHub, so there is nothing to withdraw and a withdrawal would be
@@ -1396,7 +1398,9 @@ async function revokePendingClaim(
   // entitlement is gone. `github_username` is null because nobody ever claimed it - which is exactly
   // how a consumer tells this apart from revoking a live membership. Silence here is what made the
   // original defect invisible.
+  // The claim record names the product that was sold; the refund's own product_id is often empty.
   await emitEvent(step, org, origin, sink, 'access.revoked', event, {
+    product_id: claim.product_id || event.product_id,
     github_username: null,
     teams: claim.teams ?? [],
     trigger: event.event_type,
@@ -1546,6 +1550,7 @@ async function runRevoke(
     record.teams ?? [],
     event.event_type,
     sequence,
+    record.product_id,
   )
 }
 
@@ -1560,6 +1565,8 @@ async function runRevoke(
  * `trigger` is the refund, dispute or ended access behind it, omitted from the envelopes when it is not
  * known.
  * `sequence` is the guard's number for the transition into `revoked`, carried on `access.revoked`.
+ * `productId` is the product of the grant record being withdrawn, named on `access.revoked`. It falls
+ * back to the event's own product_id only when the record has none.
  */
 async function withdrawAccess(
   step: WorkflowStep,
@@ -1574,6 +1581,7 @@ async function withdrawAccess(
   teams: string[],
   trigger: string | undefined,
   sequence: number | undefined,
+  productId: string,
 ): Promise<void> {
   const triggerField: Record<string, EnvelopeField> = trigger ? { trigger } : {}
 
@@ -1648,6 +1656,7 @@ async function withdrawAccess(
   )
 
   await emitEvent(step, org, origin, sink, 'access.revoked', event, {
+    product_id: productId || event.product_id,
     github_username: username,
     teams,
     ...(kept.length > 0 ? { kept_teams: kept } : {}),

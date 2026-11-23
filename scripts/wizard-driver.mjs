@@ -321,12 +321,13 @@ Open the product and copy its **product id** (\`prod_...\`, on the product page)
 // the dashboard (2026-07-16 in Test mode, and 2026-11-21 in a sandbox), and the wizard only ever runs
 // Stripe on test data, so that is the only name a deployer on this screen can see. Payment links are a
 // tab under Checkout, not a top-level menu item (live-confirmed 2026-10-03). The custom field is
-// required by default, so the screen has the deployer tick Mark as optional, which keeps the claim
-// page as the fallback for a buyer who leaves it empty.
+// required by default, and the screen leaves it required, so every buyer has to give a handle. A typo
+// that matches no GitHub account falls back to the claim page, where the buyer corrects it; a typo that
+// matches someone else's account is invited directly, so the screen says both.
 const PAYMENT_LINK = `Create a Payment Link: **Checkout -> Payment links -> Create test payment link -> Products or subscriptions**, select your product, quantity 1. Three things matter:
 
-1. Collect the buyer's GitHub handle: **Advanced options -> Add custom fields**, add ONE field - Type **Text**, Label **GitHub username** - and tick **Mark as optional**, because Stripe makes the field required by default and a buyer who leaves it empty is sent to the claim page instead.
-2. Wire the redirect: open the **After payment** tab, and under **Confirmation page** choose **Don't show confirmation page**, then set the redirect URL to \`https://YOUR-WORKER-URL/claim/by-txn/stripe/{CHECKOUT_SESSION_ID}\` - paste \`{CHECKOUT_SESSION_ID}\` literally, braces and all; Stripe substitutes the real checkout-session id at redirect. This lets a buyer who mistypes their handle self-correct.
+1. Collect the buyer's GitHub handle: **Advanced options -> Add custom fields**, add ONE field - Type **Text**, Label **GitHub username**. Leave **Mark as optional** off, so every buyer has to give a handle. A typo that matches no GitHub account sends the buyer to the claim page to correct it; a typo that matches someone else's account invites that account instead.
+2. Wire the redirect: open the **After payment** tab, and under **Confirmation page** choose **Don't show confirmation page**, then set the redirect URL to \`https://YOUR-WORKER-URL/claim/by-txn/stripe/{CHECKOUT_SESSION_ID}\` - paste \`{CHECKOUT_SESSION_ID}\` literally, braces and all; Stripe substitutes the real checkout-session id at redirect. This lets a buyer whose handle matches no GitHub account correct it.
 3. Tell the worker which product this is: after the link is created, open its **detail page**, scroll to **Metadata**, click **Edit metadata**, and add key \`product_id\` = \`PRODUCT-ID\` (the same \`prod_...\` from the last step). Stripe's checkout webhook omits line items, so the worker reads the product from this metadata - without it the sale maps to no team and grants nothing.
 
 Type **done** when the link is created and the metadata is set.`
@@ -496,7 +497,7 @@ Type **done** when the refund is through and \`TEST-HANDLE\` has been removed fr
 // A step whose check greens without the human is worse than no step. The walkthrough's own ordering
 // assumes the same thing: the typo test reuses the handle precisely BECAUSE the refund freed it.
 
-const TYPO_TEST_OFFER = `One more thing you can prove, optional: what a buyer sees after mistyping their GitHub username - the claim page that lets them self-correct. It takes one more test purchase and a second refund to clean up.`
+const TYPO_TEST_OFFER = `One more thing you can prove, optional: what a buyer sees after a typo that matches no GitHub account - the claim page that lets them correct it. It takes one more test purchase and a second refund to clean up.`
 
 const TYPO_TEST_OPTIONS = [
   {
@@ -594,9 +595,9 @@ const REFUND_CLAUSE = {
 // say that reports an outcome it never measured.
 const CLAIM_PATH_CLAUSE = {
   tested:
-    'A buyer who mistypes their handle self-corrects on the claim page - this run live-tested that path too.',
+    'A buyer whose handle matches no GitHub account corrects it on the claim page - this run live-tested that path too.',
   untested:
-    "A buyer who mistypes their handle self-corrects on the claim page - that path is built in; this run didn't live-test it.",
+    "A buyer whose handle matches no GitHub account corrects it on the claim page - that path is built in; this run didn't live-test it.",
 }
 
 // The tail of a sandbox closing. The repo-attach reminder is here only when 4b2's `skip` option was the

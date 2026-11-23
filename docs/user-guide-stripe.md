@@ -176,8 +176,8 @@ needs it. Open `/health` and confirm `{"status":"ok"}`.
 ## 4. Stripe: product, link, metadata, webhook
 
 1. **Create the product** (Product catalog, then Create product - this is the current label, not the
-   older "Products, then Add product"). Set a one-time price (a recurring price grants nothing in core;
-   subscriptions are a RepoAccess Pro feature). Copy the **product id** (`prod_...`) and wire it into
+   older "Products, then Add product"). Set a one-time price (a recurring price grants nothing in core).
+   Copy the **product id** (`prod_...`) and wire it into
    `productTeamMap` from Step 2.
 2. **Create a Payment Link** (Checkout, then Payment links, then Create test payment link - the label that
    button carries in a sandbox or test mode - then Products or subscriptions; select your product,
@@ -185,8 +185,10 @@ needs it. Open `/health` and confirm `{"status":"ok"}`.
    option you may want; it is optional and covered in "Stripe as merchant of record" below. For
    **`username` mode**, under **Advanced options, then Add custom fields**, add ONE field - Type
    **Text**, Label **GitHub username** (Stripe derives the field key from the label, and the worker
-   matches a key that contains "github") - and tick **Mark as optional**, because the field is required
-   by default and an empty handle is not a dead end: it falls back to the claim page. For **`claim`
+   matches a key that contains "github") - and leave **Mark as optional** off, because the field is required
+   by default and every buyer has to give a handle. A typo that matches no GitHub account sends the
+   buyer to the claim page to correct it; a typo that matches someone else's account invites that
+   account instead. For **`claim`
    mode**, add no field. Copy the link URL.
 
    In `username` mode the field lives on Stripe's checkout, so it is the last thing you control before
@@ -297,17 +299,17 @@ Run the three flows **in this order** - refund before the typo test, so each tes
    workflow, then the run, then the `emit:claim.pending` step output, which carries `claim_url`). Open
    `https://<worker>.workers.dev/claim/<token>`, enter a real handle (reuse the Step-1 handle, now that
    it was revoked), and submit. The claim grant creates a NEW GitHub invitation too - **accept the email
-   invite** (or at `https://github.com/orgs/<org>/invitation`) to become a member. A typo never strands a
-   paying buyer. (In production you do not dig this link out by hand: Step 7 wires a post-payment redirect
-   that lands the buyer on the claim page automatically.)
+   invite** (or at `https://github.com/orgs/<org>/invitation`) to become a member. A typo that matches no
+   GitHub account never strands a paying buyer. (In production you do not dig this link out by hand:
+   Step 7 wires a post-payment redirect that lands the buyer on the claim page automatically.)
 
 That single live grant verifies the whole chain: the PAT, the org hardening, the config, the webhook
 signature, and the deploy.
 
 ## 7. Deliver the claim link automatically (the post-payment redirect)
 
-In `claim` mode every buyer needs the one-time claim link, and in `username` mode a buyer who mistypes
-their handle falls back to one (Step 6, flow 3). Rather than make them dig it out of a dashboard, send
+In `claim` mode every buyer needs the one-time claim link, and in `username` mode a buyer whose handle
+matches no GitHub account falls back to one (Step 6, flow 3). Rather than make them dig it out of a dashboard, send
 them straight there: point your Stripe checkout's post-payment redirect at the worker, which resolves the
 buyer's transaction to their claim page.
 

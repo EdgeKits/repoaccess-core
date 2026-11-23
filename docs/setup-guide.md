@@ -299,7 +299,6 @@ support.
 
 1. **Create your product + a one-time price** in the Stripe dashboard. Note the **product id** (`prod_…`).
    Core sells one-time access: a checkout for a recurring (subscription) price grants nothing in core.
-   Subscriptions are a RepoAccess Pro feature.
 2. **Create a webhook** (Developers → Webhooks (Event destinations) → Add destination) pointing at your
    worker:
    `https://<your-worker-url>/wh/stripe/<SECRET_PATH>`
@@ -573,31 +572,34 @@ two `grant_mode`s:
   the **...** menu, choose **Edit**, then **Advanced options → Add custom fields**. (Or set
   `custom_fields` when creating the Checkout Session.) The label is not an example - Stripe derives the
   field's key from it, and the worker resolves the field by matching a key that contains `github`, so
-  give it exactly that label. The worker reads it from the `checkout.session.completed` event. Tick
-  **Mark as optional** under the field (Stripe makes it required by default) - an empty or mistyped
-  handle is not a dead end, it falls back to the claim page.
+  give it exactly that label. The worker reads it from the `checkout.session.completed` event. Leave
+  **Mark as optional** off under the field, so it stays required and every buyer has to give a handle.
+  A typo that matches no GitHub account sends the buyer to the claim page to correct it; a typo that
+  matches someone else's account invites that account instead.
   - _Your own checkout page:_ if you collect the username yourself before checkout, pass it through as
     `metadata.github_username` and the worker reads it from the same event.
 - **After checkout (`claim` mode).** Collect nothing at checkout. The buyer receives a one-time claim
   link after paying and enters their username on the claim page. Use this if you can't (or don't want
-  to) add a checkout field. `username` mode automatically falls back to `claim` when no username is
-  present.
+  to) add a checkout field. `username` mode automatically falls back to `claim` when the username is
+  missing, malformed or matches no GitHub account.
 
 > **Where a purchase has a pending claim, treat its transaction id as a delivery credential - even
 > though your provider doesn't.** The post-checkout redirect hands the worker a transaction (or checkout
 > session) id and the worker answers with that purchase's state. **If that purchase is waiting on a
-> claim, the answer is its claim page**, so anyone holding the id can enter a GitHub username there until
-> it is claimed or expires. That covers every `claim`-mode purchase, and any `username`-mode purchase
-> where no handle arrived and the worker fell back to a claim. A `username`-mode purchase that granted
-> directly has no claim to reach - the id answers with a neutral "access is set up" page and nothing
-> else. Your provider treats that id as an ordinary reference and puts it in dashboards, receipts and
-> logs, so wherever a claim may be pending, keep it out of shared channels: don't paste one into a group
-> chat, a public ticket or a screenshot.
+> claim, the answer is its claim page**, so anyone holding the id can enter a GitHub username there
+> until it is claimed or expires. That covers every `claim`-mode purchase, and any `username`-mode
+> purchase whose handle was missing, malformed or matched no GitHub account, so the worker fell back to
+> a claim. A `username`-mode purchase that granted directly has no claim to reach - the id answers with
+> a neutral "access is set up" page and nothing else. Your provider treats that id as an ordinary
+> reference and puts it in dashboards, receipts and logs, so wherever a claim may be pending, keep it
+> out of shared channels: don't paste one into a group chat, a public ticket or a screenshot.
 
 **What if the buyer mistypes it?** The worker never grants access directly - GitHub sends an
-**invitation that only the real owner of that account can accept**. A wrong or non-existent handle
-just means the invite is never accepted (the buyer contacts you to fix it); it can't silently let the
-wrong person in. There's deliberately **no "Login with GitHub"** step - the invite-acceptance is the
+**invitation that only the real owner of that account can accept**. A handle that matches no GitHub
+account sends no invitation: the buyer lands on the claim page and corrects it there. A handle that
+matches someone else's account invites that person, so ask buyers to check it;
+[the troubleshooting section below](#a-buyer-says-they-didnt-get-access) says what to do if it happens.
+There's deliberately **no "Login with GitHub"** step - the invite-acceptance is the
 ownership check, and the worker never phones home.
 
 ## Step 6 - Secrets
@@ -675,9 +677,11 @@ are quick to resolve. Work down this list.
    `access.granted` (it worked - it's an unaccepted invite, see above), `access.failed` with a
    `reason` (e.g. user not found, rate-limited), or `claim.pending` (claim mode - they never opened
    the link). No event store? Run `npx wrangler tail` and re-send the event from Stripe.
-2. **`access.failed → user not found`** = mistyped/non-existent username. Cancel any stale pending
-   invite (Org → People → **Pending invitations**), then re-collect: re-send the claim link, or just
-   invite them by hand (Team → Members → **Add a member**).
+2. **`access.failed` → user not found** = a handle the buyer entered on the claim page matches no GitHub
+   account. The claim link still works: the buyer enters the correct handle on the same page. (In
+   `username` mode a checkout handle that matches no account never gets here: the worker falls back to
+   a claim and sends `claim.pending`.) If the buyer is stuck, invite them by hand (Team → Members →
+   **Add a member**).
 3. **`access.failed → github_token_degraded`** = the worker's GitHub token can no longer manage
    members (expired, revoked, or the org restricted fine-grained tokens). **On a refund this needs
    your hands right away (as `revoke_error` below does): the buyer's access was NOT revoked.** Rotate the
@@ -707,8 +711,9 @@ with it.
 > GitHub invitation _is_ the identity check - only the real owner of an account can accept it.
 >
 > **That makes a mistyped handle harmless in one case and not the other, so treat them apart.** If the
-> handle belongs to **nobody**, nothing happens: the invitation sits unaccepted, and you fix it by
-> re-issuing to the correct handle. If it belongs to **somebody else**, that person can accept it, and
+> handle belongs to **nobody**, no invitation is sent: GitHub answers that the user does not exist, the
+> worker falls back to a claim (`claim.pending`), and the buyer enters the correct handle on the claim
+> page, which the post-payment redirect opens with the reason shown. If it belongs to **somebody else**, that person can accept it, and
 > the identity check has done its job on the wrong person. Act on which stage it is in. **Still
 > pending:** cancel it (Org → People → **Pending invitations**) and invite the correct handle.
 > **Already accepted:** remove that account from the product team, then from the organization if that
@@ -747,5 +752,5 @@ The engine itself is provider-agnostic - it normalizes any webhook-capable provi
 contract, and the exported types (`PaymentAdapter`, `VerificationStrategy`) are what an adapter
 implements. Core ships Stripe as the reference adapter. Ready-made adapters for Paddle
 (Merchant-of-Record), Creem (Merchant-of-Record), Gumroad, Razorpay and Telegram Stars ship in
-**RepoAccess Pro**, along with their provider-specific wiring, and Pro adds subscriptions. See the
+**RepoAccess Pro**, along with their provider-specific wiring. See the
 [RepoAccess page](https://edgekits.dev/en/tools/repoaccess/).

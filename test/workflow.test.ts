@@ -1287,6 +1287,54 @@ describe('AccessWorkflow - revoke', () => {
     )
   })
 
+  it("refund with empty event product_id → access.revoked names the GRANT RECORD's product, not the refund's empty one", async () => {
+    // Regression: the envelope repeated the refund event's own product_id, which is '' on a live
+    // Stripe refund, so the seller could not tell which product was revoked. The revoke itself read
+    // the grant record correctly; only the event named the wrong product.
+    const env = makeEnv()
+    const config = makeConfig()
+    await env.ENTITLEMENTS.put('grant:stripe:pi_1', GRANT_RECORD) // record.product_id = 'prod_x'
+    mockFetch((m, p) => {
+      if (
+        m === 'DELETE' &&
+        p === '/orgs/testorg/teams/kit-pro/memberships/octocat'
+      )
+        return { status: 204 }
+      if (m === 'GET' && p === '/orgs/testorg/invitations?per_page=100&page=1')
+        return { status: 200, body: [] }
+      if (
+        m === 'GET' &&
+        p === '/orgs/testorg/teams/kit-pro/memberships/octocat'
+      )
+        return { status: 404 }
+      if (m === 'DELETE' && p === '/orgs/testorg/memberships/octocat')
+        return { status: 204 }
+      return { status: 500 }
+    })
+    const { step } = makeStep()
+    const { events, sink } = recorder()
+
+    await executeAccessWorkflow(
+      step,
+      env,
+      config,
+      {
+        adapter: 'stripe',
+        event: evt({
+          event_type: 'refund',
+          is_full_refund: true,
+          product_id: '',
+          github_username: null,
+        }),
+      },
+      sink,
+    )
+
+    expect(events.find((e) => e.event_type === 'access.revoked')).toMatchObject(
+      { product_id: 'prod_x', trigger: 'refund' },
+    )
+  })
+
   it('grant record absent → reconciliation warning, no crash, no revoke', async () => {
     const env = makeEnv()
     const config = makeConfig()
@@ -1414,6 +1462,37 @@ describe('AccessWorkflow - revoke', () => {
     const { result, enqueue } = await redeem(token)
     expect(result.status).not.toBe('submitted')
     expect(enqueue).not.toHaveBeenCalled()
+  })
+
+  it("claim fallback → refund with empty event product_id → access.revoked names the CLAIM RECORD's product", async () => {
+    // A live Stripe refund carries product_id ''. The pending-claim revoke resolves its policy from the
+    // claim record, so its envelope must name that product too, not the refund's empty one. This is
+    // the revoke where naming the product matters most: github_username is null on it.
+    const config = makeConfig()
+    const { env } = await mintClaim(config) // claim record product_id = 'prod_x'
+
+    mockFetch(() => ({ status: 404 }))
+    const { step } = makeStep()
+    const { events, sink } = recorder()
+    await executeAccessWorkflow(
+      step,
+      env,
+      config,
+      {
+        adapter: 'stripe',
+        event: evt({
+          event_type: 'refund',
+          is_full_refund: true,
+          product_id: '',
+          github_username: null,
+        }),
+      },
+      sink,
+    )
+
+    expect(events.find((e) => e.event_type === 'access.revoked')).toMatchObject(
+      { product_id: 'prod_x', github_username: null, trigger: 'refund' },
+    )
   })
 
   it('log_only + pending claim → the claim SURVIVES and still redeems (log_only means log only)', async () => {

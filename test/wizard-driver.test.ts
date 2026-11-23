@@ -781,8 +781,17 @@ describe('screen wording', () => {
     expect(record.text).not.toContain('**Payment Links ->')
     expect(record.text).toContain('Three things matter:')
     expect(record.text).toContain(
-      '**Advanced options -> Add custom fields**, add ONE field - Type **Text**, Label **GitHub username** - and tick **Mark as optional**, because Stripe makes the field required by default and a buyer who leaves it empty is sent to the claim page instead.',
+      "**Advanced options -> Add custom fields**, add ONE field - Type **Text**, Label **GitHub username**. Leave **Mark as optional** off, so every buyer has to give a handle. A typo that matches no GitHub account sends the buyer to the claim page to correct it; a typo that matches someone else's account invites that account instead.",
     )
+    expect(record.text).not.toContain('and tick **Mark as optional**')
+    // The unconditional claim this screen used to make: only a handle nobody owns reaches the claim page.
+    expect(record.text).not.toContain(
+      'a mistyped one still reaches the claim page',
+    )
+    expect(record.text).toContain(
+      'This lets a buyer whose handle matches no GitHub account correct it.',
+    )
+    expect(record.text).not.toContain('mistypes their handle self-correct')
     // The step whose absence makes every Full run ack 200 and grant nothing.
     expect(record.text).toContain(
       'scroll to **Metadata**, click **Edit metadata**, and add key `product_id`',
@@ -1379,7 +1388,7 @@ describe('closings (one per env x goal)', () => {
 
     // The default run TOOK the typo test, so the closing may say so - and must not say the opposite.
     expect(tested.text).toContain(
-      '(A buyer who mistypes their handle self-corrects on the claim page - this run live-tested that path too.)',
+      '(A buyer whose handle matches no GitHub account corrects it on the claim page - this run live-tested that path too.)',
     )
     expect(tested.text).not.toContain("didn't live-test it")
 
@@ -1390,7 +1399,7 @@ describe('closings (one per env x goal)', () => {
       'closing',
     )
     expect(skipped.text).toContain(
-      "(A buyer who mistypes their handle self-corrects on the claim page - that path is built in; this run didn't live-test it.)",
+      "(A buyer whose handle matches no GitHub account corrects it on the claim page - that path is built in; this run didn't live-test it.)",
     )
     expect(skipped.text).not.toContain('live-tested that path too')
   })
@@ -4247,7 +4256,7 @@ describe('E6 is offered only where it can actually prove something', () => {
       'Skip',
     ])
     expect(record.text).toContain(
-      'One more thing you can prove, optional: what a buyer sees after mistyping their GitHub username',
+      'One more thing you can prove, optional: what a buyer sees after a typo that matches no GitHub account - the claim page that lets them correct it',
     )
   })
 

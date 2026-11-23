@@ -43,9 +43,10 @@ export function refundScopeOf(isFullRefund: boolean | null): RefundScope {
 
 /**
  * Build the deterministic Workflow instance id = the idempotency key. Components are
- * joined with `-` (the `:` separator is rejected by the runtime). `adapter` and `eventType` come from a
- * fixed, charset-safe vocabulary; `transactionId` is provider-defined and may (for some future
- * provider) contain out-of-charset characters or be very long.
+ * joined with `-` (the `:` separator is rejected by the runtime). `eventType` comes from a fixed,
+ * charset-safe vocabulary. `adapter` is chosen by the composer and is not validated against
+ * WORKFLOW_INSTANCE_ID_PATTERN (see the hash path below). `transactionId` is provider-defined and may
+ * (for some future provider) contain out-of-charset characters or be very long.
  *
  * Security-gate decision (availability): do NOT throw on such a transactionId - a
  * thrown id denies a paying buyer access AND makes the webhook retry forever. Instead fall back to a
@@ -95,7 +96,12 @@ export async function workflowInstanceId(
     return readable
   }
   const digest = await sha256Hex(transactionId)
-  // adapter + eventType are controlled vocab (charset-safe); the slice guards the pathological length.
+  // Length is what the slice guarantees, for any adapter name. Charset is NOT checked on this path: the
+  // digest is hex and the event type is charset-safe (a normalized event type, or `claim_completed` on
+  // the claim path), but the adapter name is chosen by the composer and nothing in createWorker
+  // validates it against WORKFLOW_INSTANCE_ID_PATTERN (only the reserved name `buyer` is refused). An
+  // adapter name outside that pattern therefore yields an id the runtime rejects here, even though the
+  // readable form above was checked.
   // Room is reserved for the suffix and it is appended AFTER, because both scopes of one transaction
   // hash the same digest - a suffix lost to the slice here would restore the whole defect for exactly
   // the providers whose transaction ids are awkward.
@@ -112,7 +118,9 @@ export async function workflowInstanceId(
  * id hashes the RAW ping body instead: identical retried pings collide → idempotent dedupe (the same
  * `createBatch` guarantee as hmac); distinct events (sale vs refund vs dispute → different bodies)
  * hash to distinct ids. `apicallback` is a fixed, charset-safe event-type slot. The SHA-256 hex is
- * charset-safe and length-bounded; `adapter` is controlled vocab (slice guards a pathological name).
+ * charset-safe and length-bounded. `adapter` is chosen by the composer and is not validated against
+ * WORKFLOW_INSTANCE_ID_PATTERN, as in workflowInstanceId: the slice bounds the length for any name, but
+ * an adapter name outside that pattern yields an id the runtime rejects.
  */
 export async function apiCallbackInstanceId(
   adapter: string,
